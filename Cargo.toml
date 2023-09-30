@@ -1,0 +1,12 @@
+[package]
+name = "netproxy"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+readme = "README.md"
+
+
+[dependencies]
+clap = { version = "*", features = ["derive"] }
+tokio = { version = "*", features = ["full"] }
+rustls = "*"
