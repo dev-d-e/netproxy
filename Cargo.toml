@@ -9,4 +9,6 @@ readme = "README.md"
 [dependencies]
 clap = { version = "*", features = ["derive"] }
 tokio = { version = "*", features = ["full"] }
-rustls = "*"
+tokio-native-tls = "*"
+log = "*"
+env_logger = "*"
