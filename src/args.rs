@@ -1,39 +1,69 @@
 pub(crate) use clap::Parser;
-use std::net::SocketAddr;
 use std::process::Command;
 
-pub(crate) const CFGTOOL: &str = "on";
+const YES: &str = "yes";
 
-pub(crate) const SOCKETSAFE: &str = "off";
+const NO: &str = "no";
 
 /// Arguments
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Args {
     /// The specified socket to receive configuration
-    #[arg(short, long, default_value_t = SocketAddr::from(([127, 0, 0, 1], 0)))]
-    pub(crate) socket: SocketAddr,
+    #[arg(short, long, default_value = "127.0.0.1:0")]
+    pub(crate) socket: String,
 
     /// Configuration should be from allowable ips. Scope is "localhost" when it's empty
     #[arg(long)]
     pub(crate) ipscope: Option<Vec<String>>,
 
-    /// Use cfg tool if = "on"
-    #[arg(long)]
-    pub(crate) cfgtool: Option<String>,
+    /// Whether to use cfg tool (yes/no)
+    #[arg(long, default_value = NO)]
+    pub(crate) cfgtool: String,
 
-    /// No use safe connection to socket if = "off"
-    #[arg(long)]
-    pub(crate) socsafe: Option<String>,
+    /// Whether to use safe connection to socket (yes/no)
+    #[arg(long, default_value = NO)]
+    pub(crate) socsafe: String,
 }
 
-pub(crate) fn use_cfgtool(addr: SocketAddr) {
-    let _process = match Command::new("./cfgtool")
-        .arg("-t")
-        .arg(addr.to_string())
-        .spawn()
-    {
-        Ok(process) => process,
-        Err(e) => panic!("fail to spawn 'cfgtool': {}", e),
-    };
+impl Args {
+    pub(crate) fn is_tool(&self) -> bool {
+        YES == self.cfgtool
+    }
+
+    pub(crate) fn check_tool(&self, s: String) {
+        if self.is_tool() {
+            if self.is_safe() {
+                std::thread::spawn(move || {
+                    let _process = match Command::new("./cfgtool")
+                        .arg("-t")
+                        .arg(s)
+                        .arg("--socsafe")
+                        .arg(YES)
+                        .spawn()
+                    {
+                        Ok(process) => process,
+                        Err(e) => panic!("fail to spawn 'cfgtool': {}", e),
+                    };
+                });
+            } else {
+                std::thread::spawn(move || {
+                    let _process = match Command::new("./cfgtool")
+                        .arg("-t")
+                        .arg(s)
+                        .arg("--socsafe")
+                        .arg(NO)
+                        .spawn()
+                    {
+                        Ok(process) => process,
+                        Err(e) => panic!("fail to spawn 'cfgtool': {}", e),
+                    };
+                });
+            }
+        }
+    }
+
+    pub(crate) fn is_safe(&self) -> bool {
+        NO != self.socsafe
+    }
 }
