@@ -1,10 +1,10 @@
 use super::{
-    get_index, into_str, FuncR, FuncRouteAlg, Procedure, Protoc, RouteFinder, Server, Transfer,
+    get_identity, get_index, into_str, FuncR, FuncRouteAlg, Procedure, Protoc, RouteFinder, Server,
+    Transfer,
 };
-use crate::core::{find_header, parse_header};
 use crate::{route_alg, transfer_data};
 use async_trait::async_trait;
-use log::{debug, error, info, trace};
+use log::{debug, error, trace};
 
 route_alg!(
     RouteAlg,
@@ -13,11 +13,7 @@ route_alg!(
     {
         let str = into_str(buf);
         trace!("http request:{:?}", str);
-        let headers = parse_header(&str);
-        let host = find_header("Host", &headers);
-        if host.is_none() {
-            return None;
-        }
+
         let s = self.0[self.2[self.1]].clone();
         self.1 = (self.1 + 1) % self.2.len();
         Some(s)
@@ -30,54 +26,96 @@ route_alg!(
 transfer_data!(Empty, self, _buf, {}, {});
 
 async fn http_to_http(tf: Transfer) {
-    let server = Server::new(&tf.server_addr).await.unwrap();
+    trace!("http_to_http");
+    let server = match Server::new(&tf.server_addr).await {
+        Ok(server) => server,
+        Err(e) => {
+            error!("Server error:{:?}", e);
+            return;
+        }
+    };
     let pd = Procedure::new(
         RouteFinder::new(
             RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
             Protoc::TLS,
         ),
         Empty,
+        Empty,
     );
-    info!("{:?} http_to_http", std::thread::current().id());
-    server.tls(pd).await;
+    let t = match get_identity() {
+        Some(t) => t,
+        None => {
+            error!("server fail");
+            return;
+        }
+    };
+    server.tls(pd, t).await;
 }
 
 async fn http_to_http_pt(tf: Transfer) {
-    let server = Server::new(&tf.server_addr).await.unwrap();
+    trace!("http_to_http_pt");
+    let server = match Server::new(&tf.server_addr).await {
+        Ok(server) => server,
+        Err(e) => {
+            error!("Server error:{:?}", e);
+            return;
+        }
+    };
     let pd = Procedure::new(
         RouteFinder::new(
             RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
             Protoc::TCP,
         ),
         Empty,
+        Empty,
     );
-    info!("{:?} http_to_http_pt", std::thread::current().id());
-    server.tls(pd).await;
+    let t = match get_identity() {
+        Some(t) => t,
+        None => {
+            error!("server fail");
+            return;
+        }
+    };
+    server.tls(pd, t).await;
 }
 
 async fn http_pt_to_http(tf: Transfer) {
-    let server = Server::new(&tf.server_addr).await.unwrap();
+    trace!("http_pt_to_http");
+    let server = match Server::new(&tf.server_addr).await {
+        Ok(server) => server,
+        Err(e) => {
+            error!("Server error:{:?}", e);
+            return;
+        }
+    };
     let pd = Procedure::new(
         RouteFinder::new(
             RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
             Protoc::TLS,
         ),
         Empty,
+        Empty,
     );
-    info!("{:?} http_pt_to_http", std::thread::current().id());
     server.tcp(pd).await;
 }
 
 async fn http_pt_to_http_pt(tf: Transfer) {
-    let server = Server::new(&tf.server_addr).await.unwrap();
+    trace!("http_pt_to_http_pt");
+    let server = match Server::new(&tf.server_addr).await {
+        Ok(server) => server,
+        Err(e) => {
+            error!("Server error:{:?}", e);
+            return;
+        }
+    };
     let pd = Procedure::new(
         RouteFinder::new(
             RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
             Protoc::TCP,
         ),
         Empty,
+        Empty,
     );
-    info!("{:?} http_pt_to_http_pt", std::thread::current().id());
     server.tcp(pd).await;
 }
 
