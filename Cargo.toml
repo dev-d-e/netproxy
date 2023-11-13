@@ -7,8 +7,14 @@ readme = "README.md"
 
 
 [dependencies]
+async-trait = "*"
+bytes = { version = "*", optional = true }
 clap = { version = "*", features = ["derive"] }
+env_logger = "*"
+httpdate = "*"
+httparse = "*"
+lazy_static = "*"
+log = "*"
 tokio = { version = "*", features = ["full"] }
 tokio-native-tls = "*"
-log = "*"
-env_logger = "*"
+utf8parse = "*"
