@@ -1,30 +1,22 @@
 #[macro_export]
 macro_rules! tcp_stream_start {
-    ($reader:ident, $buf:ident, $n:ident , $state:ident) => {
+    ($reader:ident, $buf:ident) => {
         let _ = $reader.readable().await;
         loop {
             match $reader.try_read_buf(&mut $buf) {
                 Ok(n) => {
                     trace!("tcp_stream_start {}", n);
-                    if n > 0 {
-                        if $buf.len() > $n {
-                            break;
-                        }
-                        continue;
-                    } else {
-                        $state.0 = true;
+                    if n == 0 {
                         break;
                     }
+                    continue;
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("tcp_stream_start WouldBlock");
-                        $state.1 = true;
                         break;
                     } else {
-                        error!("tcp_stream_start error:{:?}", e);
-                        $state.0 = true;
-                        $state.2 = Some(e);
+                        error!("tcp_stream_start error: {:?}", e);
                         break;
                     }
                 }
@@ -35,21 +27,18 @@ macro_rules! tcp_stream_start {
 
 #[macro_export]
 macro_rules! tcp_stream_read {
-    ($reader:ident, $buf:ident, $func:ident, $wr:ident, $state:ident) => {
+    ($reader:ident, $buf:ident, $func:ident, $wr:ident, $state:ident, $str:literal) => {
         loop {
-            let _ = $reader.readable().await;
             match $reader.try_read_buf(&mut $buf) {
                 Ok(n) => {
-                    trace!("tcp_stream_read {}", n);
+                    trace!("{} tcp_stream_read {}", $str, n);
                     if n > 0 {
-                        if n > 1024 {
-                            $func.data(&mut $buf).await;
-                            if let Err(e) = $wr.write_all(&$buf).await {
-                                $state.2 = true;
-                                $state.3 = Some(e)
-                            }
-                            $buf.clear();
+                        $func.data(&mut $buf).await;
+                        if let Err(e) = $wr.write_all(&$buf).await {
+                            error!("{} write error: {:?}", $str, e);
+                            $state.2 = true;
                         }
+                        $buf.clear();
                         continue;
                     } else {
                         $state.0 = true;
@@ -58,25 +47,24 @@ macro_rules! tcp_stream_read {
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
-                        debug!("tcp_stream_read WouldBlock");
+                        debug!("{} tcp_stream_read WouldBlock", $str);
                         $state.1 = true;
                         break;
                     } else {
-                        error!("tcp_stream_read error:{:?}", e);
+                        error!("{} tcp_stream_read error: {:?}", $str, e);
                         $state.0 = true;
-                        $state.3 = Some(e);
                         break;
                     }
                 }
             }
         }
-        if $buf.len() > 0 || $state.1 {
+        if $state.0 || $state.1 {
             $func.enddata(&mut $buf).await;
         }
         if $buf.len() > 0 {
             if let Err(e) = $wr.write_all(&$buf).await {
                 $state.2 = true;
-                $state.3 = Some(e)
+                error!("{} write error: {:?}", $str, e);
             }
             $buf.clear();
         }
@@ -84,48 +72,58 @@ macro_rules! tcp_stream_read {
 }
 
 #[macro_export]
-macro_rules! async_ext_read {
-    ($reader:ident, $buf:ident, $func:ident, $wr:ident, $state:ident) => {
-        loop {
-            match $reader.read_buf(&mut $buf).await {
-                Ok(n) => {
-                    trace!("async_ext_read {}", n);
-                    if n > 0 {
-                        if n > 1024 {
-                            $func.data(&mut $buf).await;
-                            if let Err(e) = $wr.write_all(&$buf).await {
-                                $state.2 = true;
-                                $state.3 = Some(e)
-                            }
-                            $buf.clear();
-                        }
-                        continue;
-                    } else {
-                        $state.0 = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        debug!("async_ext_read WouldBlock");
-                        $state.1 = true;
-                        break;
-                    } else {
-                        error!("async_ext_read error:{:?}", e);
-                        $state.0 = true;
-                        $state.3 = Some(e);
-                        break;
-                    }
+macro_rules! async_ext_start {
+    ($reader:ident, $buf:ident) => {
+        match $reader.read_buf(&mut $buf).await {
+            Ok(n) => {
+                trace!("async_ext_start {}", n);
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    debug!("async_ext_start WouldBlock");
+                } else {
+                    error!("async_ext_start error: {:?}", e);
                 }
             }
         }
-        if $buf.len() > 0 || $state.1 {
+    };
+}
+
+#[macro_export]
+macro_rules! async_ext_read {
+    ($read:ident, $buf:ident, $func:ident, $wr:ident, $state:ident, $str:literal) => {
+        match $read {
+            Ok(n) => {
+                trace!("{} async_ext_read {}", $str, n);
+                if n > 0 {
+                    $func.data(&mut $buf).await;
+                    if let Err(e) = $wr.write_all(&$buf).await {
+                        error!("{} write error: {:?}", $str, e);
+                        $state.2 = true;
+                    }
+                    $buf.clear();
+                } else {
+                    $state.0 = true;
+                }
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    debug!("{} async_ext_read WouldBlock", $str);
+                    $state.1 = true;
+                } else {
+                    error!("{} async_ext_read error:{:?}", $str, e);
+                    $state.0 = true;
+                }
+            }
+        }
+
+        if $state.0 || $state.1 {
             $func.enddata(&mut $buf).await;
         }
         if $buf.len() > 0 {
             if let Err(e) = $wr.write_all(&$buf).await {
+                error!("{} write error: {:?}", $str, e);
                 $state.2 = true;
-                $state.3 = Some(e)
             }
             $buf.clear();
         }
@@ -147,8 +145,8 @@ macro_rules! async_ext_rw {
                         }
                         if $w_buf.len() > 0 {
                             if let Err(e) = $server.write_all(&$w_buf).await {
+                                error!("async_ext_rw write error: {:?}", e);
                                 $state.2 = true;
-                                $state.3 = Some(e)
                             }
                             $w_buf.clear();
                         }
@@ -164,9 +162,8 @@ macro_rules! async_ext_rw {
                         $state.1 = true;
                         break;
                     } else {
-                        error!("async_ext_rw error:{:?}", e);
+                        error!("async_ext_rw read error:{:?}", e);
                         $state.0 = true;
-                        $state.3 = Some(e);
                         break;
                     }
                 }
@@ -178,8 +175,8 @@ macro_rules! async_ext_rw {
         }
         if $w_buf.len() > 0 {
             if let Err(e) = $server.write_all(&$w_buf).await {
+                error!("async_ext_rw write error: {:?}", e);
                 $state.2 = true;
-                $state.3 = Some(e)
             }
             $w_buf.clear();
         }
