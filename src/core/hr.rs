@@ -1,7 +1,9 @@
+use super::into_str;
 use httparse::Request;
+use httparse::Status::Complete;
 use log::trace;
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{Error, ErrorKind::InvalidData, Result};
 
 #[derive(Debug)]
 pub(crate) struct HttpRequest {
@@ -10,16 +12,14 @@ pub(crate) struct HttpRequest {
     pub(crate) _version: u8,
     pub(crate) headers: HashMap<String, Vec<u8>>,
     //byte offset to start of HTTP body
-    pub(crate) _offset: usize,
+    pub(crate) _offset: u32,
 }
 
 impl HttpRequest {
     pub(crate) fn find_header_value(&self, str: &str) -> Option<String> {
         let v = self.headers.get(str)?;
-        match String::from_utf8(v.to_vec()) {
-            Ok(s) => Some(s),
-            Err(_) => None,
-        }
+        let mut v = v.to_vec();
+        Some(into_str(&mut v))
     }
 
     pub(crate) fn find_host_value(&self) -> Option<String> {
@@ -27,19 +27,15 @@ impl HttpRequest {
     }
 }
 
-pub(crate) fn parse_request(str: &[u8]) -> std::io::Result<HttpRequest> {
+///parse request header
+pub(crate) fn parse_request(buf: &[u8]) -> Result<HttpRequest> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = Request::new(&mut headers);
-    let mut offset: usize = 0;
-    let status = req
-        .parse(str)
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-
-    if status.is_complete() {
-        offset = status.unwrap();
+    let mut offset = 0;
+    if let Complete(n) = req.parse(buf).map_err(|e| Error::new(InvalidData, e))? {
+        offset = n as u32;
     }
 
-    trace!("httparse header:{:?}", req.headers);
     let method = req.method.unwrap_or("").to_string();
     let path = req.path.unwrap_or("").to_string();
     let version = req.version.unwrap_or(0);
@@ -47,6 +43,7 @@ pub(crate) fn parse_request(str: &[u8]) -> std::io::Result<HttpRequest> {
     for h in req.headers {
         headers.insert(h.name.to_string(), h.value.to_vec());
     }
+    trace!("parse_request header:{:?}", headers.keys());
     Ok(HttpRequest {
         method,
         path,
