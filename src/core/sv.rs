@@ -1,29 +1,39 @@
 use async_trait::async_trait;
+use lazy_static::lazy_static;
 use log::{debug, error, info, trace};
 use std::fmt::Debug;
-use std::io::ErrorKind;
+use std::io::{Error, ErrorKind::InvalidData, ErrorKind::NotConnected, Result};
 use std::marker::Send;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::oneshot::Receiver;
 use tokio_native_tls::native_tls::{
     Identity, Protocol, TlsAcceptor as NativeAcceptor, TlsConnector as NativeConnector,
 };
 use tokio_native_tls::{TlsAcceptor, TlsConnector, TlsStream};
 
-fn get_tls(identity: Identity) -> Option<TlsAcceptor> {
-    let nta = match NativeAcceptor::builder(identity)
-        .min_protocol_version(Some(Protocol::Tlsv12))
-        .build()
-    {
-        Ok(nta) => nta,
-        Err(e) => {
-            error!("get \"TlsAcceptor\" error:{:?}", e);
-            return None;
-        }
+const CAPACITY: usize = 8192;
+
+lazy_static! {
+    static ref TLS_CONNECTOR: TlsConnector = get_connector();
+}
+
+fn get_connector() -> TlsConnector {
+    let c = match NativeConnector::new() {
+        Ok(c) => c,
+        Err(e) => panic!("{}", e),
     };
+    TlsConnector::from(c)
+}
+
+///the minimum supported TLS protocol version is 1.2
+fn get_tls(identity: Identity) -> Result<TlsAcceptor> {
+    let mut builder = NativeAcceptor::builder(identity);
+    builder.min_protocol_version(Some(Protocol::Tlsv12));
+    let nta = builder.build().map_err(|e| Error::new(InvalidData, e))?;
     let acceptor = TlsAcceptor::from(nta);
-    Some(acceptor)
+    Ok(acceptor)
 }
 
 #[async_trait]
@@ -40,67 +50,83 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    pub(crate) async fn new(str: &String) -> std::io::Result<Server> {
+    pub(crate) async fn new(str: &String) -> Result<Server> {
         info!("Server bind[{}]", str);
         let listener = TcpListener::bind(str).await?;
         let addr = listener.local_addr()?;
         Ok(Server { listener, addr })
     }
 
-    pub(crate) async fn tcp<T>(self, func: T)
+    pub(crate) async fn tcp<T>(&mut self, func: T, mut rx: Receiver<u8>)
     where
         T: FuncStream,
     {
         loop {
-            let socket = match self.listener.accept().await {
-                Ok((socket, _)) => socket,
-                Err(e) => {
-                    error!("Server(tcp) accept error:{:?}", e);
-                    continue;
-                }
-            };
-            trace!("Server(tcp) accept");
+            tokio::select! {
+                socket = self.listener.accept() => {
+                    let socket = match socket {
+                        Ok((socket, _)) => socket,
+                        Err(e) => {
+                            error!("Server(tcp) accept error:{:?}", e);
+                            continue;
+                        }
+                    };
+                    trace!("Server(tcp) accept");
 
-            let func = func.clone();
-            tokio::spawn(async move {
-                func.tcp(socket).await;
-            });
+                    let func = func.clone();
+                    tokio::spawn(async move {
+                        func.tcp(socket).await;
+                    });
+                },
+                Ok(_) = &mut rx => {
+                    info!("Server(tcp) {:?} stop", self.addr.to_string());
+                    return;
+                }
+            }
         }
     }
 
-    pub(crate) async fn tls<T>(self, func: T, identity: Identity)
+    pub(crate) async fn tls<T>(&mut self, func: T, identity: Identity, mut rx: Receiver<u8>)
     where
         T: FuncStream,
     {
         let tls_acceptor = match get_tls(identity) {
-            Some(tls_acceptor) => tls_acceptor,
-            None => {
-                error!("Server(tls) can not get \"TlsAcceptor\"");
+            Ok(tls_acceptor) => tls_acceptor,
+            Err(e) => {
+                error!("Server(tls) can not get \"TlsAcceptor\" error:{:?}", e);
                 return;
             }
         };
         loop {
-            let socket = match self.listener.accept().await {
-                Ok((socket, _)) => socket,
-                Err(e) => {
-                    error!("Server(tls) accept error:{:?}", e);
-                    continue;
-                }
-            };
-            trace!("Server(tls) accept");
+            tokio::select! {
+                socket = self.listener.accept() => {
+                    let socket=match socket{
+                        Ok((socket, _)) => socket,
+                        Err(e) => {
+                            error!("Server(tls) accept error:{:?}", e);
+                            continue;
+                        }
+                    };
+                    trace!("Server(tls) accept");
 
-            let tls_acceptor = tls_acceptor.clone();
-            let func = func.clone();
-            tokio::spawn(async move {
-                let socket = match tls_acceptor.accept(socket).await {
-                    Ok(socket) => socket,
-                    Err(e) => {
-                        error!("Server(tls) accept error:{:?}", e);
-                        return;
-                    }
-                };
-                func.tls(socket).await;
-            });
+                    let tls_acceptor = tls_acceptor.clone();
+                    let func = func.clone();
+                    tokio::spawn(async move {
+                        let socket = match tls_acceptor.accept(socket).await {
+                            Ok(socket) => socket,
+                            Err(e) => {
+                                error!("Server(tls) acceptor error:{:?}", e);
+                                return;
+                            }
+                        };
+                        func.tls(socket).await;
+                    });
+                }
+                Ok(_) = &mut rx => {
+                    info!("Server(tls) {:?} stop", self.addr.to_string());
+                    return;
+                }
+            }
         }
     }
 }
@@ -116,7 +142,7 @@ pub(crate) struct UdpServer {
 }
 
 impl UdpServer {
-    pub(crate) async fn new(str: &String) -> std::io::Result<UdpServer> {
+    pub(crate) async fn new(str: &String) -> Result<UdpServer> {
         info!("Server bind({})", str);
         let socket = UdpSocket::bind(str).await?;
         let addr = socket.local_addr()?;
@@ -129,7 +155,7 @@ impl UdpServer {
     {
         let socket = Arc::new(self.socket);
         loop {
-            let mut buf = Vec::<u8>::with_capacity(10240);
+            let mut buf = Vec::<u8>::with_capacity(CAPACITY);
             match socket.recv_buf_from(&mut buf).await {
                 Ok((n, from)) => {
                     trace!("Server(udp) recv {}", n);
@@ -153,33 +179,29 @@ impl UdpServer {
     }
 }
 
-pub(crate) async fn connect(str: &String) -> std::io::Result<TcpStream> {
+pub(crate) async fn connect(str: &String) -> Result<TcpStream> {
     let ts = TcpStream::connect(str).await?;
     debug!(
         "connect[{:?}]-[{:?}]",
-        if let Ok(s) = &ts.local_addr() {
-            s.to_string()
-        } else {
-            "".to_string()
-        },
-        if let Ok(s) = &ts.peer_addr() {
-            s.to_string()
-        } else {
-            "".to_string()
-        }
+        &ts.local_addr()
+            .map(|s| s.to_string())
+            .unwrap_or("".to_string()),
+        &ts.peer_addr()
+            .map(|s| s.to_string())
+            .unwrap_or("".to_string())
     );
     Ok(ts)
 }
 
-pub(crate) async fn connect_tls(str: &String) -> std::io::Result<TlsStream<TcpStream>> {
+pub(crate) async fn connect_tls(str: &String) -> Result<TlsStream<TcpStream>> {
     let socket = connect(&str).await?;
-    let c = NativeConnector::new().map_err(|e| std::io::Error::new(ErrorKind::NotConnected, e))?;
-    let c = TlsConnector::from(c);
     let mut s = str.clone();
     if let Some(n) = str.find(':') {
         s.truncate(n);
     }
+
+    let c = &TLS_CONNECTOR;
     c.connect(s.as_str(), socket)
         .await
-        .map_err(|e| std::io::Error::new(ErrorKind::NotConnected, e))
+        .map_err(|e| Error::new(NotConnected, e))
 }
