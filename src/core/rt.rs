@@ -1,6 +1,7 @@
-use log::{debug, error};
+use log::{debug, error, info};
 use std::future::Future;
 use std::thread;
+use std::time::Duration;
 use tokio::runtime::Builder;
 
 pub(crate) fn tokiort_block_on<T>(function: T)
@@ -20,6 +21,9 @@ where
     };
 
     rt.block_on(function);
+
+    rt.shutdown_background();
+    info!("runtime shutdown");
 }
 
 pub(crate) fn new_thread_tokiort_block_on<T>(function: T)
@@ -37,5 +41,8 @@ where
         };
 
         rt.block_on(function);
+
+        rt.shutdown_timeout(Duration::from_secs(1));
+        info!("thread runtime shutdown");
     });
 }
