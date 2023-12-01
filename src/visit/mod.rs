@@ -1,28 +1,48 @@
-use crate::core::{
-    self, get_identity, into_str, parse_request, FuncR, FuncRemote, Procedure, Protoc, Server,
-};
+use crate::core::*;
+use crate::state;
 use crate::transfer_data;
 use async_trait::async_trait;
-use log::{debug, error, trace};
+use log::{debug, error};
+use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
 struct VisitFinder(Protoc);
 
 #[async_trait]
 impl FuncRemote for VisitFinder {
-    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, usize)> {
-        let str = into_str(buf);
-        trace!("http request:{:?}", str);
-        let req = match parse_request(&str.as_bytes()) {
+    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, u32)> {
+        let req = match parse_request(buf) {
             Ok(req) => req,
             Err(e) => {
                 error!("http request error:{:?}", e);
                 return None;
             }
         };
-        let host = req.find_host_value()?;
-        Some((self.0.clone(), host + ":443", 0))
+        let mut host = req.find_host_value()?;
+        if self.0 == Protoc::HTTP {
+            host = http_port(host);
+            Some((Protoc::TLS, host, 0))
+        } else if self.0 == Protoc::HTTPPT {
+            host = http_pt_port(host);
+            Some((Protoc::TCP, host, 0))
+        } else {
+            None
+        }
     }
+}
+
+fn http_pt_port(mut str: String) -> String {
+    if let None = str.find(':') {
+        str.push_str(":80");
+    }
+    str
+}
+
+fn http_port(mut str: String) -> String {
+    if let None = str.find(':') {
+        str.push_str(":443");
+    }
+    str
 }
 
 transfer_data!(Empty, self, _buf, {}, {});
@@ -31,48 +51,58 @@ transfer_data!(Empty, self, _buf, {}, {});
 pub(crate) struct Visit {
     pub(crate) server_protoc: Protoc,
     pub(crate) server_addr: String,
+    pub(crate) remote_protoc: Protoc,
 }
 
 pub(crate) fn start_up(vt: Visit) {
     debug!("{:?}", vt);
-    core::new_thread_tokiort_block_on(async move {
+    new_thread_tokiort_block_on(async move {
         match vt.server_protoc {
-            Protoc::HTTP => tls(vt).await,
-            Protoc::HTTPPT => tcp(vt).await,
+            Protoc::HTTP => http(vt).await,
+            Protoc::HTTPPT => http_pt(vt).await,
             _ => {}
         }
     });
 }
 
-async fn tls(vt: Visit) {
+async fn http(vt: Visit) {
     debug!("Server tls start up");
-    let server = match Server::new(&vt.server_addr).await {
-        Ok(server) => server,
-        Err(e) => {
-            error!("Server error:{:?}", e);
-            return;
-        }
-    };
-    let pd = Procedure::new(VisitFinder(Protoc::TLS), Empty, Empty);
-    let t = match get_identity() {
-        Some(t) => t,
+    let i = match valid_identity().await {
+        Some(i) => i,
         None => {
             error!("Server fail");
             return;
         }
     };
-    server.tls(pd, t).await;
-}
 
-async fn tcp(vt: Visit) {
-    debug!("Server tcp start up");
-    let server = match Server::new(&vt.server_addr).await {
+    let mut server = match Server::new(&vt.server_addr).await {
         Ok(server) => server,
         Err(e) => {
             error!("Server error:{:?}", e);
             return;
         }
     };
-    let pd = Procedure::new(VisitFinder(Protoc::TLS), Empty, Empty);
-    server.tcp(pd).await;
+
+    let (tx, rx) = oneshot::channel();
+    state::hold(server.addr.to_string(), tx).await;
+
+    let pd = Procedure::new(VisitFinder(vt.remote_protoc), Empty, Empty);
+    server.tls(pd, i, rx).await;
+}
+
+async fn http_pt(vt: Visit) {
+    debug!("Server tcp start up");
+    let mut server = match Server::new(&vt.server_addr).await {
+        Ok(server) => server,
+        Err(e) => {
+            error!("Server error:{:?}", e);
+            return;
+        }
+    };
+
+    let (tx, rx) = oneshot::channel();
+    state::hold(server.addr.to_string(), tx).await;
+
+    let pd = Procedure::new(VisitFinder(vt.remote_protoc), Empty, Empty);
+    server.tcp(pd, rx).await;
 }
