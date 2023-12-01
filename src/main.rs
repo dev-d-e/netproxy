@@ -1,10 +1,11 @@
+#![allow(dead_code)]
+
 mod args;
 mod builder;
 mod core;
 mod route;
+mod state;
 mod visit;
-
-use args::{Args, Parser};
 
 ///It's a fast and convenient network proxy.
 ///Route data according to some configuration sentences.
@@ -14,9 +15,7 @@ use args::{Args, Parser};
 pub fn main() {
     env_logger::builder().init();
 
-    let args = Args::parse();
+    let args = args::init();
 
-    builder::build_server(&args.socket, args.is_safe(), |s| {
-        args.check_tool(s);
-    });
+    builder::build(args);
 }
