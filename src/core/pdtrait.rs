@@ -4,7 +4,7 @@ use std::marker::Send;
 
 #[async_trait]
 pub(crate) trait FuncRemote: Clone + Send + Sync + 'static {
-    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, usize)>;
+    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, u32)>;
 }
 
 #[async_trait]
