@@ -1,10 +1,12 @@
 mod http;
 
-use crate::core::{self, get_identity, into_str, FuncR, FuncRemote, Procedure, Protoc, Server};
+use crate::core::*;
+use crate::state;
 use crate::transfer_data;
 use async_trait::async_trait;
 use log::{debug, error, trace};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 
 pub(crate) trait FuncRouteAlg: Send + Sync + 'static {
@@ -35,22 +37,18 @@ impl<T: FuncRouteAlg> Clone for RouteFinder<T> {
 
 #[async_trait]
 impl<T: FuncRouteAlg> FuncRemote for RouteFinder<T> {
-    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, usize)> {
+    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, u32)> {
         let mut lock = self.0.lock().await;
-        let s = lock.addr(buf);
+        let addr = lock.addr(buf);
         drop(lock);
-        match s {
-            Some(s) => {
-                trace!("RouteFinder get:({:?})", s);
-                Some((self.1.clone(), s, 0))
-            }
-            None => None,
-        }
+        let s = addr?;
+        trace!("RouteFinder get:({:?})", s);
+        Some((self.1.clone(), s, 0))
     }
 }
 
 impl<T: FuncRouteAlg> RouteFinder<T> {
-    fn new(a: T, p: Protoc) -> RouteFinder<T> {
+    fn new(a: T, p: Protoc) -> Self {
         RouteFinder(Arc::new(Mutex::new(a)), p)
     }
 }
@@ -105,10 +103,10 @@ transfer_data!(Empty, self, _buf, {}, {});
 
 pub(crate) fn start_up(tf: Transfer) {
     debug!("{:?}", tf);
-    core::new_thread_tokiort_block_on(async move {
+    new_thread_tokiort_block_on(async move {
         match tf.server_protoc {
-            Protoc::HTTP => http::accept(tf).await,
-            Protoc::HTTPPT => http::accept(tf).await,
+            Protoc::HTTP => http::http(tf).await,
+            Protoc::HTTPPT => http::http_pt(tf).await,
             Protoc::TCP => tcp(tf).await,
             Protoc::TLS => tls(tf).await,
             Protoc::UDP => udp(tf).await,
@@ -118,75 +116,51 @@ pub(crate) fn start_up(tf: Transfer) {
 
 async fn tcp(tf: Transfer) {
     debug!("Server tcp start up");
-    let server = match Server::new(&tf.server_addr).await {
+    let mut server = match Server::new(&tf.server_addr).await {
         Ok(server) => server,
         Err(e) => {
             error!("Server error:{:?}", e);
             return;
         }
     };
-    if tf.remote_protoc == Protoc::TCP {
-        let pd = Procedure::new(
-            RouteFinder::new(
-                RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
-                Protoc::TCP,
-            ),
-            Empty,Empty
-        );
-        server.tcp(pd).await;
-    } else if tf.remote_protoc == Protoc::TLS {
-        let pd = Procedure::new(
-            RouteFinder::new(
-                RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
-                Protoc::TLS,
-            ),
-            Empty,Empty
-        );
-        server.tcp(pd).await;
+
+    let (tx, rx) = oneshot::channel();
+    state::hold(server.addr.to_string(), tx).await;
+
+    let protoc = tf.remote_protoc;
+    if protoc == Protoc::TCP || protoc == Protoc::TLS {
+        let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
+        let pd = Procedure::new(RouteFinder::new(ra, protoc), Empty, Empty);
+        server.tcp(pd, rx).await;
     }
 }
 
 async fn tls(tf: Transfer) {
     debug!("Server tls start up");
-    let server = match Server::new(&tf.server_addr).await {
+    let i = match valid_identity().await {
+        Some(i) => i,
+        None => {
+            error!("Server fail");
+            return;
+        }
+    };
+
+    let mut server = match Server::new(&tf.server_addr).await {
         Ok(server) => server,
         Err(e) => {
             error!("Server error:{:?}", e);
             return;
         }
     };
-    if tf.remote_protoc == Protoc::TCP {
-        let pd = Procedure::new(
-            RouteFinder::new(
-                RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
-                Protoc::TCP,
-            ),
-            Empty,Empty
-        );
-        let t = match get_identity() {
-            Some(t) => t,
-            None => {
-                error!("server fail");
-                return;
-            }
-        };
-        server.tls(pd, t).await;
-    } else if tf.remote_protoc == Protoc::TLS {
-        let pd = Procedure::new(
-            RouteFinder::new(
-                RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion)),
-                Protoc::TLS,
-            ),
-            Empty,Empty
-        );
-        let t = match get_identity() {
-            Some(t) => t,
-            None => {
-                error!("server fail");
-                return;
-            }
-        };
-        server.tls(pd, t).await;
+
+    let (tx, rx) = oneshot::channel();
+    state::hold(server.addr.to_string(), tx).await;
+
+    let protoc = tf.remote_protoc;
+    if protoc == Protoc::TCP || protoc == Protoc::TLS {
+        let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
+        let pd = Procedure::new(RouteFinder::new(ra, protoc), Empty, Empty);
+        server.tls(pd, i, rx).await;
     }
 }
 
