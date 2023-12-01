@@ -1,45 +1,50 @@
-use log::trace;
-use std::fs;
-use std::path::PathBuf;
+use super::get_file;
+use lazy_static::lazy_static;
+use std::io::{Error, ErrorKind, Result};
+use tokio::sync::Mutex;
 use tokio_native_tls::native_tls::Identity;
 
-const CERTIFICATE: &str = "./cert";
-
-fn get_certificate(path: &str) -> std::io::Result<Vec<u8>> {
-    let metadata = fs::metadata(path)?;
-    if metadata.is_file() {
-        trace!("certificate file:{:?}", path);
-        return fs::read(path);
-    } else if metadata.is_dir() {
-        let entries = fs::read_dir(path)?;
-        let mut v: Vec<PathBuf> = entries
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                if let Ok(e) = entry.metadata() {
-                    return e.is_file();
-                }
-                false
-            })
-            .map(|entry| entry.path())
-            .collect();
-
-        // read a file, if there are some files, sort and choose first.
-        if v.len() > 0 {
-            if v.len() > 1 {
-                v.sort();
-            }
-            trace!("certificate file:{:?}", &v[0]);
-            return fs::read(&v[0]);
-        }
-    }
-    trace!("no certificate in [{:?}]", path);
-    Ok(Vec::new())
+lazy_static! {
+    static ref VALID_IDENTITY: Mutex<Vec<Identity>> = Mutex::new(Vec::new());
 }
 
-pub(crate) fn get_identity() -> Option<Identity> {
-    match get_certificate(CERTIFICATE) {
-        Ok(_) => {}
-        Err(_) => {}
-    };
-    None
+async fn add_identity(identity: Identity) {
+    VALID_IDENTITY.lock().await.push(identity);
+}
+
+async fn get_identity() -> Option<Identity> {
+    VALID_IDENTITY.lock().await.first().cloned()
+}
+
+async fn build_identity(data: &[u8], pwd: &str) -> Option<Error> {
+    match Identity::from_pkcs12(data, pwd) {
+        Ok(identity) => {
+            add_identity(identity).await;
+            None
+        }
+        Err(e) => Some(Error::new(ErrorKind::InvalidData, e)),
+    }
+}
+
+///get certificate info from "VALID_IDENTITY".
+pub(crate) async fn valid_identity() -> Option<Identity> {
+    get_identity().await
+}
+
+///input file path and  password
+///get certificate data from file
+///then build identity
+pub(crate) async fn build_certificate_from_file(path: String, pwd: String) -> Result<usize> {
+    let f = get_file(&path)?;
+    if let Some(e) = build_identity(f.as_slice(), &pwd).await {
+        return Err(e);
+    }
+    Ok(f.len())
+}
+
+///input socket and  password
+///get certificate data from socket
+///then build identity
+pub(crate) async fn build_certificate_from_socket(_soc: String, _pwd: String) -> Result<usize> {
+    Ok(0)
 }
