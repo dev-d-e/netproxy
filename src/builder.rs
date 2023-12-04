@@ -11,7 +11,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use tokio::sync::oneshot::{self, Sender};
+use tokio::sync::oneshot::Sender;
 use tokio::sync::Mutex;
 
 const HTTP: &str = "http";
@@ -364,10 +364,10 @@ pub(crate) fn build(args: Args) {
 
         let pd = ProcedureService::new(Service);
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, sc) = state::no_hold().await;
         CURRENT_TX.lock().await.push(tx);
 
-        server.tcp(pd, rx).await;
+        server.tcp(pd, sc).await;
 
         close_tool();
     });
@@ -388,7 +388,7 @@ pub(crate) fn build(args: Args) {
 
         let pd = ProcedureService::new(Service);
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, sc) = state::no_hold().await;
         CURRENT_TX.lock().await.push(tx);
 
         let t = match valid_identity().await {
@@ -398,7 +398,7 @@ pub(crate) fn build(args: Args) {
                 return;
             }
         };
-        server.tls(pd, t, rx).await;
+        server.tls(pd, t, sc).await;
     });
 }
 
