@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot::Receiver;
+use tokio::time::{self, Duration};
 use tokio_native_tls::native_tls::{
     Identity, Protocol, TlsAcceptor as NativeAcceptor, TlsConnector as NativeConnector,
 };
@@ -37,6 +38,13 @@ fn get_tls(identity: Identity) -> Result<TlsAcceptor> {
 }
 
 #[async_trait]
+pub(crate) trait FuncControl {
+    fn stop_receiver(&mut self) -> Receiver<u8>;
+
+    async fn velocity(&self, velocity: u32);
+}
+
+#[async_trait]
 pub(crate) trait FuncStream: Clone + Send + Sync + 'static {
     async fn tcp(self, socket: TcpStream);
 
@@ -57,10 +65,13 @@ impl Server {
         Ok(Server { listener, addr })
     }
 
-    pub(crate) async fn tcp<T>(&mut self, func: T, mut rx: Receiver<u8>)
+    pub(crate) async fn tcp<T>(&mut self, func: T, mut c: impl FuncControl)
     where
         T: FuncStream,
     {
+        let mut rx = c.stop_receiver();
+        let mut n: u32 = 0;
+        let mut interval = time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 socket = self.listener.accept() => {
@@ -77,16 +88,23 @@ impl Server {
                     tokio::spawn(async move {
                         func.tcp(socket).await;
                     });
+                    n += 1;
                 },
                 Ok(_) = &mut rx => {
                     info!("Server(tcp) {:?} stop", self.addr.to_string());
                     return;
                 }
+                _ = interval.tick() => {
+                    if n > 0 {
+                        c.velocity(n).await;
+                        n = 0;
+                    }
+                }
             }
         }
     }
 
-    pub(crate) async fn tls<T>(&mut self, func: T, identity: Identity, mut rx: Receiver<u8>)
+    pub(crate) async fn tls<T>(&mut self, func: T, identity: Identity, mut c: impl FuncControl)
     where
         T: FuncStream,
     {
@@ -97,6 +115,9 @@ impl Server {
                 return;
             }
         };
+        let mut rx = c.stop_receiver();
+        let mut n: u32 = 0;
+        let mut interval = time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 socket = self.listener.accept() => {
@@ -121,10 +142,17 @@ impl Server {
                         };
                         func.tls(socket).await;
                     });
+                    n += 1;
                 }
                 Ok(_) = &mut rx => {
                     info!("Server(tls) {:?} stop", self.addr.to_string());
                     return;
+                }
+                _ = interval.tick() => {
+                    if n > 0 {
+                        c.velocity(n).await;
+                        n = 0;
+                    }
                 }
             }
         }
