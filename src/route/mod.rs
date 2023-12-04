@@ -6,7 +6,6 @@ use crate::transfer_data;
 use async_trait::async_trait;
 use log::{debug, error, trace};
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 
 pub(crate) trait FuncRouteAlg: Send + Sync + 'static {
@@ -124,14 +123,13 @@ async fn tcp(tf: Transfer) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let protoc = tf.remote_protoc;
     if protoc == Protoc::TCP || protoc == Protoc::TLS {
         let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
         let pd = Procedure::new(RouteFinder::new(ra, protoc), Empty, Empty);
-        server.tcp(pd, rx).await;
+        server.tcp(pd, sc).await;
     }
 }
 
@@ -153,14 +151,13 @@ async fn tls(tf: Transfer) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let protoc = tf.remote_protoc;
     if protoc == Protoc::TCP || protoc == Protoc::TLS {
         let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
         let pd = Procedure::new(RouteFinder::new(ra, protoc), Empty, Empty);
-        server.tls(pd, i, rx).await;
+        server.tls(pd, i, sc).await;
     }
 }
 
