@@ -14,7 +14,7 @@ pub(crate) use pdtrait::{FuncR, FuncRemote, FuncRw};
 pub(crate) use rt::{new_thread_tokiort_block_on, tokiort_block_on};
 use std::fs;
 use std::path::PathBuf;
-pub(crate) use sv::{connect, connect_tls, FuncStream, Server};
+pub(crate) use sv::{connect, connect_tls, FuncControl, FuncStream, Server};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Protoc {
