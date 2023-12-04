@@ -45,12 +45,11 @@ async fn http_to_http(tf: Transfer) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
     let pd = Procedure::new(RouteFinder::new(ra, Protoc::TLS), Empty, Empty);
-    server.tls(pd, i, rx).await;
+    server.tls(pd, i, sc).await;
 }
 
 async fn http_to_http_pt(tf: Transfer) {
@@ -71,12 +70,11 @@ async fn http_to_http_pt(tf: Transfer) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
     let pd = Procedure::new(RouteFinder::new(ra, Protoc::TCP), Empty, Empty);
-    server.tls(pd, i, rx).await;
+    server.tls(pd, i, sc).await;
 }
 
 async fn http_pt_to_http(tf: Transfer) {
@@ -89,12 +87,11 @@ async fn http_pt_to_http(tf: Transfer) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
     let pd = Procedure::new(RouteFinder::new(ra, Protoc::TLS), Empty, Empty);
-    server.tcp(pd, rx).await;
+    server.tcp(pd, sc).await;
 }
 
 async fn http_pt_to_http_pt(tf: Transfer) {
@@ -107,12 +104,11 @@ async fn http_pt_to_http_pt(tf: Transfer) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
     let pd = Procedure::new(RouteFinder::new(ra, Protoc::TCP), Empty, Empty);
-    server.tcp(pd, rx).await;
+    server.tcp(pd, sc).await;
 }
 
 pub(crate) async fn http(tf: Transfer) {
