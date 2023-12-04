@@ -3,7 +3,6 @@ use crate::state;
 use crate::transfer_data;
 use async_trait::async_trait;
 use log::{debug, error};
-use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
 struct VisitFinder(Protoc);
@@ -83,11 +82,10 @@ async fn http(vt: Visit) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let pd = Procedure::new(VisitFinder(vt.remote_protoc), Empty, Empty);
-    server.tls(pd, i, rx).await;
+    server.tls(pd, i, sc).await;
 }
 
 async fn http_pt(vt: Visit) {
@@ -100,9 +98,8 @@ async fn http_pt(vt: Visit) {
         }
     };
 
-    let (tx, rx) = oneshot::channel();
-    state::hold(server.addr.to_string(), tx).await;
+    let sc = state::hold(server.addr.to_string()).await;
 
     let pd = Procedure::new(VisitFinder(vt.remote_protoc), Empty, Empty);
-    server.tcp(pd, rx).await;
+    server.tcp(pd, sc).await;
 }
