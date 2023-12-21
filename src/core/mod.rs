@@ -15,6 +15,7 @@ pub(crate) use rt::{new_thread_tokiort_block_on, tokiort_block_on};
 use std::fs;
 use std::path::PathBuf;
 pub(crate) use sv::{connect, connect_tls, FuncControl, FuncStream, Server};
+use time::{OffsetDateTime, UtcOffset};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Protoc {
@@ -77,4 +78,17 @@ fn get_file(path: &str) -> std::io::Result<Vec<u8>> {
     }
     trace!("no file in [{:?}]", path);
     Ok(Vec::new())
+}
+
+///get the system time.
+pub(crate) fn now_str() -> String {
+    let now = OffsetDateTime::now_utc();
+    if let Ok(i) = UtcOffset::current_local_offset() {
+        now.to_offset(i);
+    }
+    let mut date_time = now.to_string();
+    if date_time.len() > 19 {
+        date_time.truncate(19);
+    }
+    date_time
 }
