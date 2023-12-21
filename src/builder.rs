@@ -364,8 +364,9 @@ pub(crate) fn build(args: Args) {
 
         let pd = ProcedureService::new(Service);
 
-        let (tx, sc) = state::no_hold().await;
+        let (tx, mut sc) = state::no_hold().await;
         CURRENT_TX.lock().await.push(tx);
+        sc.get_scope().extend_from_slice(&ipscope);
 
         server.tcp(pd, sc).await;
 
@@ -388,8 +389,9 @@ pub(crate) fn build(args: Args) {
 
         let pd = ProcedureService::new(Service);
 
-        let (tx, sc) = state::no_hold().await;
+        let (tx, mut sc) = state::no_hold().await;
         CURRENT_TX.lock().await.push(tx);
+        sc.get_scope().extend_from_slice(&ipscope);
 
         let t = match valid_identity().await {
             Some(t) => t,
