@@ -16,6 +16,7 @@ httparse = "*"
 lazy_static = "*"
 log = "*"
 regex = "*"
+time = { version = "*", features = ["macros", "formatting", "parsing", "local-offset", "serde"] }
 tokio = { version = "*", features = ["full"] }
 tokio-native-tls = "*"
 utf8parse = "*"
