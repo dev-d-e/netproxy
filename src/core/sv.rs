@@ -4,7 +4,7 @@ use log::{debug, error, info, trace};
 use std::fmt::Debug;
 use std::io::{Error, ErrorKind::InvalidData, ErrorKind::NotConnected, Result};
 use std::marker::Send;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot::Receiver;
@@ -40,6 +40,8 @@ fn get_tls(identity: Identity) -> Result<TlsAcceptor> {
 #[async_trait]
 pub(crate) trait FuncControl {
     fn stop_receiver(&mut self) -> Receiver<u8>;
+
+    async fn reject_ip(&self, ip: IpAddr) -> bool;
 
     async fn velocity(&self, velocity: u32);
 }
@@ -84,13 +86,22 @@ impl Server {
                     };
                     trace!("Server(tcp) accept");
 
+                    if let Ok(peer_addr) = socket.peer_addr() {
+                        let ip = peer_addr.ip();
+                        if c.reject_ip(ip).await {
+                            info!("Server(tcp) reject ip {:?}", ip);
+                            drop(socket);
+                            continue;
+                        }
+                    }
+
                     let func = func.clone();
                     tokio::spawn(async move {
                         func.tcp(socket).await;
                     });
                     n += 1;
                 },
-                Ok(_) = &mut rx => {
+                Ok(_) =  &mut rx => {
                     info!("Server(tcp) {:?} stop", self.addr.to_string());
                     return;
                 }
@@ -129,6 +140,15 @@ impl Server {
                         }
                     };
                     trace!("Server(tls) accept");
+
+                    if let Ok(peer_addr) = socket.peer_addr() {
+                        let ip = peer_addr.ip();
+                        if c.reject_ip(ip).await {
+                            info!("Server(tls) reject ip {:?}", ip);
+                            drop(socket);
+                            continue;
+                        }
+                    }
 
                     let tls_acceptor = tls_acceptor.clone();
                     let func = func.clone();
