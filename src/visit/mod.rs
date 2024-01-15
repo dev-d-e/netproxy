@@ -10,14 +10,14 @@ struct VisitFinder(Protoc);
 #[async_trait]
 impl FuncRemote for VisitFinder {
     async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, u32)> {
-        let req = match parse_request(buf) {
+        let mut req = match parse_request(buf) {
             Ok(req) => req,
             Err(e) => {
                 error!("http request error:{:?}", e);
                 return None;
             }
         };
-        let mut host = req.find_host_value()?;
+        let mut host = req.get_host();
         if self.0 == Protoc::HTTP {
             host = http_port(host);
             Some((Protoc::TLS, host, 0))
