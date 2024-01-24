@@ -1,25 +1,26 @@
 use clap::Parser;
-use lazy_static::lazy_static;
 use log::error;
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 const YES: &str = "yes";
 
 const NO: &str = "no";
 
-lazy_static! {
-    static ref CHILD: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+static CHILD: OnceLock<Mutex<Vec<Child>>> = OnceLock::new();
+
+fn child_vec() -> &'static Mutex<Vec<Child>> {
+    CHILD.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn add_child(c: Child) {
-    if let Ok(mut v) = CHILD.lock() {
+    if let Ok(mut v) = child_vec().lock() {
         v.push(c);
     }
 }
 
 fn get_child() -> Option<Child> {
-    if let Ok(mut v) = CHILD.lock() {
+    if let Ok(mut v) = child_vec().lock() {
         v.pop()
     } else {
         None
