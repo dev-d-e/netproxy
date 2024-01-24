@@ -1,15 +1,16 @@
 use crate::core::{now_str, FuncControl};
 use async_trait::async_trait;
-use lazy_static::lazy_static;
 use log::error;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use tokio::sync::{oneshot, Mutex, OnceCell};
 
-use tokio::sync::oneshot;
-use tokio::sync::Mutex;
+static SERVER_STATE: OnceCell<Mutex<HashMap<String, ServerState>>> = OnceCell::const_new();
 
-lazy_static! {
-    static ref SERVER_STATE: Mutex<HashMap<String, ServerState>> = Mutex::new(HashMap::new());
+async fn server_state() -> &'static Mutex<HashMap<String, ServerState>> {
+    SERVER_STATE
+        .get_or_init(|| async { Mutex::new(HashMap::new()) })
+        .await
 }
 
 #[derive(Debug)]
@@ -62,7 +63,7 @@ impl FuncControl for ServerControl {
     }
 
     async fn velocity(&self, velocity: u32) {
-        if let Some(ss) = SERVER_STATE.lock().await.get_mut(&self.server) {
+        if let Some(ss) = server_state().await.lock().await.get_mut(&self.server) {
             ss.velocity = velocity;
             ss.date_time = now_str();
         }
@@ -84,11 +85,15 @@ impl ServerControl {
 }
 
 async fn add_state(ss: ServerState) {
-    SERVER_STATE.lock().await.insert((&ss.server).clone(), ss);
+    server_state()
+        .await
+        .lock()
+        .await
+        .insert((&ss.server).clone(), ss);
 }
 
 async fn remove_state(server: &String) -> Option<ServerState> {
-    SERVER_STATE.lock().await.remove(server)
+    server_state().await.lock().await.remove(server)
 }
 
 pub(crate) async fn hold(server: String) -> ServerControl {
@@ -98,7 +103,7 @@ pub(crate) async fn hold(server: String) -> ServerControl {
 }
 
 pub(crate) async fn list() -> String {
-    let map = SERVER_STATE.lock().await;
+    let map = server_state().await.lock().await;
     let mut str = String::new();
     for (key, val) in map.iter() {
         str.push_str(key);
@@ -117,7 +122,7 @@ pub(crate) async fn list() -> String {
 }
 
 pub(crate) async fn state_string(server: &String) -> String {
-    let map = SERVER_STATE.lock().await;
+    let map = server_state().await.lock().await;
     let mut str = String::new();
     if let Some(ss) = map.get(server) {
         str.push_str(&ss.server);
