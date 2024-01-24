@@ -5,14 +5,14 @@ use crate::rw_service;
 use crate::state;
 use crate::visit::{self, Visit};
 use async_trait::async_trait;
-use lazy_static::lazy_static;
 use log::{debug, error, trace};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use tokio::sync::oneshot::Sender;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 const HTTP: &str = "http";
 const HTTP_PT: &str = "http_pt";
@@ -50,86 +50,148 @@ const OUTCOMES: [(u8, &str); 8] = [
 
 static mut SAFE: bool = false;
 
-lazy_static! {
-    static ref REGEX_PROTOCOL: Regex =
-        Regex::new(r"^(http|http_pt|tcp|tls|udp)(-(http|http_pt|tcp|tls|udp)|-|)$").unwrap();
-    static ref REGEX_VISIT_PROTOCOL: Regex =
-        Regex::new(r"^(http|http_pt)(-(http|http_pt)|-|)$").unwrap();
-    static ref REGEX_CERTIFICATE: Regex = Regex::new(r"^certificate (f|s) ").unwrap();
+static REGEX_PROTOCOL: OnceCell<Regex> = OnceCell::const_new();
+
+async fn regex_protocol() -> &'static Regex {
+    REGEX_PROTOCOL
+        .get_or_init(|| async {
+            Regex::new(r"^(http|http_pt|tcp|tls|udp)(-(http|http_pt|tcp|tls|udp)|-|)$").unwrap()
+        })
+        .await
 }
 
-lazy_static! {
-    static ref CURRENT_TX: Mutex<Vec<Sender<u8>>> = Mutex::new(Vec::new());
-    static ref CURRENT_ADDR: Mutex<String> = Mutex::new(String::new());
-    static ref IP_SCOPE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static REGEX_VISIT_PROTOCOL: OnceLock<Regex> = OnceLock::new();
+
+fn regex_visit_protocol() -> &'static Regex {
+    REGEX_VISIT_PROTOCOL
+        .get_or_init(|| Regex::new(r"^(http|http_pt)(-(http|http_pt)|-|)$").unwrap())
 }
 
-lazy_static! {
-    static ref KW_MAP: Mutex<HashMap<&'static str, CfgType>> = Mutex::new(HashMap::from(KEYWORDS));
-    static ref P_MAP: Mutex<HashMap<&'static str, Protoc>> = Mutex::new(HashMap::from(PROTOCS));
-    static ref OC_MAP: Mutex<HashMap<u8, &'static str>> = Mutex::new(HashMap::from(OUTCOMES));
-    static ref CHECKERS: Mutex<HashMap<CfgType, Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>>> = {
-        let mut map: HashMap<
-            CfgType,
-            Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>,
-        > = HashMap::new();
-        map.insert(
-            CfgType::Transfer,
-            Box::new(|_s, v| {
-                if v.len() > 2 {
-                    if let Ok(_) = v[1].parse::<SocketAddr>() {
-                        trace!("transfer configuration");
+static REGEX_CERTIFICATE: OnceLock<Regex> = OnceLock::new();
+
+fn regex_certificate() -> &'static Regex {
+    REGEX_CERTIFICATE.get_or_init(|| Regex::new(r"^certificate (f|s) ").unwrap())
+}
+
+static CURRENT_TX: OnceCell<Mutex<Vec<Sender<u8>>>> = OnceCell::const_new();
+
+async fn current_tx() -> &'static Mutex<Vec<Sender<u8>>> {
+    CURRENT_TX
+        .get_or_init(|| async { Mutex::new(Vec::new()) })
+        .await
+}
+
+static CURRENT_ADDR: OnceCell<Mutex<String>> = OnceCell::const_new();
+
+async fn current_addr() -> &'static Mutex<String> {
+    CURRENT_ADDR
+        .get_or_init(|| async { Mutex::new(String::new()) })
+        .await
+}
+
+static IP_SCOPE: OnceCell<Mutex<Vec<String>>> = OnceCell::const_new();
+
+async fn ip_scope() -> &'static Mutex<Vec<String>> {
+    IP_SCOPE
+        .get_or_init(|| async { Mutex::new(Vec::new()) })
+        .await
+}
+
+static KW_MAP: OnceCell<Mutex<HashMap<&'static str, CfgType>>> = OnceCell::const_new();
+
+async fn kw_map() -> &'static Mutex<HashMap<&'static str, CfgType>> {
+    KW_MAP
+        .get_or_init(|| async { Mutex::new(HashMap::from(KEYWORDS)) })
+        .await
+}
+
+static P_MAP: OnceCell<Mutex<HashMap<&'static str, Protoc>>> = OnceCell::const_new();
+
+async fn p_map() -> &'static Mutex<HashMap<&'static str, Protoc>> {
+    P_MAP
+        .get_or_init(|| async { Mutex::new(HashMap::from(PROTOCS)) })
+        .await
+}
+
+static OC_MAP: OnceCell<Mutex<HashMap<u8, &'static str>>> = OnceCell::const_new();
+
+async fn oc_map() -> &'static Mutex<HashMap<u8, &'static str>> {
+    OC_MAP
+        .get_or_init(|| async { Mutex::new(HashMap::from(OUTCOMES)) })
+        .await
+}
+
+static CHECKERS: OnceCell<
+    Mutex<HashMap<CfgType, Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>>>,
+> = OnceCell::const_new();
+
+async fn checkers() -> &'static Mutex<
+    HashMap<CfgType, Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>>,
+> {
+    CHECKERS
+        .get_or_init(|| async {
+            let mut map: HashMap<
+                CfgType,
+                Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>,
+            > = HashMap::new();
+            map.insert(
+                CfgType::Transfer,
+                Box::new(|_s, v| {
+                    if v.len() > 2 {
+                        if let Ok(_) = v[1].parse::<SocketAddr>() {
+                            trace!("transfer configuration");
+                            return true;
+                        }
+                    }
+                    false
+                }),
+            );
+            map.insert(
+                CfgType::Visit,
+                Box::new(|_s, v| {
+                    if v.len() == 2 && regex_visit_protocol().is_match(&v[0]) {
+                        if let Ok(_) = v[1].parse::<SocketAddr>() {
+                            trace!("visit configuration");
+                            return true;
+                        }
+                    }
+                    false
+                }),
+            );
+            map.insert(
+                CfgType::Certificate,
+                Box::new(|s, v| {
+                    if v.len() == 4 && regex_certificate().is_match(s) {
+                        trace!("certificate configuration");
                         return true;
                     }
-                }
-                false
-            }),
-        );
-        map.insert(
-            CfgType::Visit,
-            Box::new(|_s, v| {
-                if v.len() == 2 && REGEX_VISIT_PROTOCOL.is_match(&v[0]) {
-                    if let Ok(_) = v[1].parse::<SocketAddr>() {
-                        trace!("visit configuration");
+                    false
+                }),
+            );
+            map.insert(
+                CfgType::State,
+                Box::new(|_s, v| {
+                    let n = v.len();
+                    if n == 1 || n == 2 {
+                        trace!("state configuration");
                         return true;
                     }
-                }
-                false
-            }),
-        );
-        map.insert(
-            CfgType::Certificate,
-            Box::new(|s, v| {
-                if v.len() == 4 && REGEX_CERTIFICATE.is_match(s) {
-                    trace!("certificate configuration");
-                    return true;
-                }
-                false
-            }),
-        );
-        map.insert(
-            CfgType::State,
-            Box::new(|_s, v| {
-                let n = v.len();
-                if n == 1 || n == 2 {
-                    trace!("state configuration");
-                    return true;
-                }
-                false
-            }),
-        );
-        map.insert(
-            CfgType::Shutdown,
-            Box::new(|_s, v| {
-                if v.len() == 2 {
-                    trace!("shutdown configuration");
-                    return true;
-                }
-                false
-            }),
-        );
-        Mutex::new(map)
-    };
+                    false
+                }),
+            );
+            map.insert(
+                CfgType::Shutdown,
+                Box::new(|_s, v| {
+                    if v.len() == 2 {
+                        trace!("shutdown configuration");
+                        return true;
+                    }
+                    false
+                }),
+            );
+            Mutex::new(map)
+        })
+        .await
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -142,7 +204,7 @@ enum CfgType {
 }
 
 async fn get_outcome(k: u8) -> String {
-    let map = OC_MAP.lock().await;
+    let map = oc_map().await.lock().await;
     match map.get(&k) {
         Some(s) => s.to_string(),
         None => "nothing".to_string(),
@@ -176,7 +238,7 @@ async fn check(str: &str) -> Result<(CfgType, Vec<String>), u8> {
     let n = v.len();
     trace!("configuration check");
     if n > 0 {
-        let ct = if REGEX_PROTOCOL.is_match(&v[0]) {
+        let ct = if regex_protocol().await.is_match(&v[0]) {
             if n > 2 {
                 CfgType::Transfer
             } else if n == 2 {
@@ -185,13 +247,13 @@ async fn check(str: &str) -> Result<(CfgType, Vec<String>), u8> {
                 return Err(1);
             }
         } else {
-            let map = KW_MAP.lock().await;
+            let map = kw_map().await.lock().await;
             match map.get(v[0].as_str()) {
                 Some(ct) => ct.clone(),
                 None => return Err(1),
             }
         };
-        let map = CHECKERS.lock().await;
+        let map = checkers().await.lock().await;
         if let Some(checker) = map.get(&ct) {
             if checker(str, &v) {
                 trace!("pass");
@@ -237,7 +299,7 @@ async fn take_effect(ct: CfgType, v: Vec<String>) -> Result<String, u8> {
                 if SAFE {
                     trace!("CURRENT_TX send");
                     //send stop signal to current server
-                    if let Some(tx) = CURRENT_TX.lock().await.pop() {
+                    if let Some(tx) = current_tx().await.lock().await.pop() {
                         if let Err(e) = tx.send(0) {
                             error!("CURRENT_TX send error:{:?}", e);
                         }
@@ -302,7 +364,7 @@ async fn two_protoc(str: &str) -> Result<(Protoc, Protoc), u8> {
 }
 
 async fn to_protoc(str: &str) -> Result<Protoc, u8> {
-    let map = P_MAP.lock().await;
+    let map = p_map().await.lock().await;
     match map.get(&str) {
         Some(p) => Ok(p.clone()),
         None => Err(2),
@@ -359,13 +421,17 @@ pub(crate) fn build(args: Args) {
             spawn_tool(server.addr.to_string(), false);
         }
 
-        CURRENT_ADDR.lock().await.push_str(&server.addr.to_string());
-        IP_SCOPE.lock().await.extend_from_slice(&ipscope);
+        current_addr()
+            .await
+            .lock()
+            .await
+            .push_str(&server.addr.to_string());
+        ip_scope().await.lock().await.extend_from_slice(&ipscope);
 
         let pd = ProcedureService::new(Service);
 
         let (tx, mut sc) = state::no_hold().await;
-        CURRENT_TX.lock().await.push(tx);
+        current_tx().await.lock().await.push(tx);
         sc.get_scope().extend_from_slice(&ipscope);
 
         server.tcp(pd, sc).await;
@@ -390,7 +456,7 @@ pub(crate) fn build(args: Args) {
         let pd = ProcedureService::new(Service);
 
         let (tx, mut sc) = state::no_hold().await;
-        CURRENT_TX.lock().await.push(tx);
+        current_tx().await.lock().await.push(tx);
         sc.get_scope().extend_from_slice(&ipscope);
 
         let t = match valid_identity().await {
