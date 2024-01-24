@@ -1,19 +1,22 @@
 use super::get_file;
-use lazy_static::lazy_static;
 use std::io::{Error, ErrorKind, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_native_tls::native_tls::Identity;
 
-lazy_static! {
-    static ref VALID_IDENTITY: Mutex<Vec<Identity>> = Mutex::new(Vec::new());
+static VALID_IDENTITY: OnceCell<Mutex<Vec<Identity>>> = OnceCell::const_new();
+
+async fn identity_vec() -> &'static Mutex<Vec<Identity>> {
+    VALID_IDENTITY
+        .get_or_init(|| async { Mutex::new(Vec::new()) })
+        .await
 }
 
 async fn add_identity(identity: Identity) {
-    VALID_IDENTITY.lock().await.push(identity);
+    identity_vec().await.lock().await.push(identity);
 }
 
 async fn get_identity() -> Option<Identity> {
-    VALID_IDENTITY.lock().await.first().cloned()
+    identity_vec().await.lock().await.first().cloned()
 }
 
 async fn build_identity(data: &[u8], pwd: &str) -> Option<Error> {
