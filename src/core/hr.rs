@@ -1,13 +1,14 @@
-use httpenergy::{to_request, RequestUnits};
+use httpenergy::{new_request_units, RequestUnits};
 use log::trace;
 use std::io::Result;
 
 #[derive(Debug)]
-pub(crate) struct HttpRequest {
+pub(crate) struct HttpRequest<'a> {
     req: RequestUnits,
+    buf: &'a Vec<u8>,
 }
 
-impl HttpRequest {
+impl<'a> HttpRequest<'a> {
     pub(crate) fn method(&mut self) -> String {
         self.req.method().to_string()
     }
@@ -21,7 +22,8 @@ impl HttpRequest {
     }
 
     pub(crate) fn get_header_value(&mut self, str: &str) -> String {
-        self.req.header_value_string(str)
+        let buf = self.buf.as_slice();
+        self.req.header_value_string(str, buf)
     }
 
     pub(crate) fn get_host(&mut self) -> String {
@@ -30,8 +32,8 @@ impl HttpRequest {
 }
 
 ///parse request header
-pub(crate) fn parse_request(buf: &[u8]) -> Result<HttpRequest> {
+pub(crate) fn parse_request<'a>(buf: &'a Vec<u8>) -> Result<HttpRequest> {
     trace!("request buf: {:?}", buf.len());
-    let req = to_request(buf);
-    Ok(HttpRequest { req })
+    let req = new_request_units(buf);
+    Ok(HttpRequest { req, buf })
 }
