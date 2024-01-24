@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use lazy_static::lazy_static;
 use log::{debug, error, info, trace};
 use std::fmt::Debug;
 use std::io::{Error, ErrorKind::InvalidData, ErrorKind::NotConnected, Result};
@@ -8,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot::Receiver;
+use tokio::sync::OnceCell;
 use tokio::time::{self, Duration};
 use tokio_native_tls::native_tls::{
     Identity, Protocol, TlsAcceptor as NativeAcceptor, TlsConnector as NativeConnector,
@@ -16,8 +16,12 @@ use tokio_native_tls::{TlsAcceptor, TlsConnector, TlsStream};
 
 const CAPACITY: usize = 8192;
 
-lazy_static! {
-    static ref TLS_CONNECTOR: TlsConnector = get_connector();
+static TLS_CONNECTOR: OnceCell<TlsConnector> = OnceCell::const_new();
+
+async fn tls_connector() -> &'static TlsConnector {
+    TLS_CONNECTOR
+        .get_or_init(|| async { get_connector() })
+        .await
 }
 
 fn get_connector() -> TlsConnector {
@@ -248,7 +252,7 @@ pub(crate) async fn connect_tls(str: &String) -> Result<TlsStream<TcpStream>> {
         s.truncate(n);
     }
 
-    let c = &TLS_CONNECTOR;
+    let c = tls_connector().await;
     c.connect(s.as_str(), socket)
         .await
         .map_err(|e| Error::new(NotConnected, e))
