@@ -1,6 +1,5 @@
 use crate::core::*;
 use crate::state;
-use crate::transfer_data;
 use async_trait::async_trait;
 use log::{debug, error};
 
@@ -9,7 +8,7 @@ struct VisitFinder(Protoc);
 
 #[async_trait]
 impl FuncRemote for VisitFinder {
-    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, u32)> {
+    async fn get(&mut self, buf: &mut Vec<u8>) -> Option<Remote> {
         let mut req = match parse_request(buf) {
             Ok(req) => req,
             Err(e) => {
@@ -20,10 +19,10 @@ impl FuncRemote for VisitFinder {
         let mut host = req.get_host();
         if self.0 == Protoc::HTTP {
             host = http_port(host);
-            Some((Protoc::TLS, host, 0))
+            Some(Remote::new(Protoc::TLS, host))
         } else if self.0 == Protoc::HTTPPT {
             host = http_pt_port(host);
-            Some((Protoc::TCP, host, 0))
+            Some(Remote::new(Protoc::TCP, host))
         } else {
             None
         }
@@ -44,13 +43,37 @@ fn http_port(mut str: String) -> String {
     str
 }
 
-transfer_data!(Empty, self, _buf, {}, {});
-
 #[derive(Debug)]
 pub(crate) struct Visit {
     pub(crate) server_protoc: Protoc,
     pub(crate) server_addr: String,
     pub(crate) remote_protoc: Protoc,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VisitR {
+    sum: usize,
+}
+
+#[async_trait]
+impl FuncR for VisitR {
+    async fn data(&mut self, buf: &mut Vec<u8>) {
+        self.sum += buf.len();
+    }
+
+    async fn enddata(&mut self, buf: &mut Vec<u8>) {
+        self.sum += buf.len();
+    }
+}
+
+impl VisitR {
+    fn new() -> Self {
+        Self { sum: 0 }
+    }
+
+    fn sum(&self) -> usize {
+        self.sum
+    }
 }
 
 pub(crate) fn start_up(vt: Visit) {
@@ -84,7 +107,7 @@ async fn http(vt: Visit) {
 
     let sc = state::hold(server.addr.to_string()).await;
 
-    let pd = Procedure::new(VisitFinder(vt.remote_protoc), Empty, Empty);
+    let pd = Procedure::new(VisitFinder(vt.remote_protoc), VisitR::new(), VisitR::new());
     server.tls(pd, i, sc).await;
 }
 
@@ -100,6 +123,6 @@ async fn http_pt(vt: Visit) {
 
     let sc = state::hold(server.addr.to_string()).await;
 
-    let pd = Procedure::new(VisitFinder(vt.remote_protoc), Empty, Empty);
+    let pd = Procedure::new(VisitFinder(vt.remote_protoc), VisitR::new(), VisitR::new());
     server.tcp(pd, sc).await;
 }
