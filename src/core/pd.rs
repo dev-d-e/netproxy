@@ -1,5 +1,4 @@
 use super::{connect, connect_tls, FuncR, FuncRemote, FuncRw, FuncStream, Protoc};
-use crate::{async_ext_read, async_ext_rw, async_ext_start, tcp_stream_read, tcp_stream_start};
 use async_trait::async_trait;
 use log::{debug, error, trace, warn};
 use std::fmt::Debug;
@@ -31,47 +30,47 @@ where
     T: FuncRemote,
     S: FuncR,
 {
-    async fn tcp(self, server: TcpStream) {
+    async fn tcp(mut self, server: TcpStream) {
         trace!("Procedure start");
         let mut buf = Vec::<u8>::with_capacity(CAPACITY);
         tcp_stream_start!(server, buf);
         if buf.len() == 0 {
             return;
         }
-        let (protoc, remote, _n) = match self.0.get(&mut buf).await {
+        let remote = match self.0.get(&mut buf).await {
             Some(r) => r,
             None => {
                 warn!("no remote");
                 return;
             }
         };
-        debug!("remote[{:?}]", remote);
-        if protoc == Protoc::TCP {
-            tcp_to_tcp(server, buf, remote, self.1, self.2).await;
+        debug!("remote[{:?}]", remote.host);
+        if remote.protoc == Protoc::TCP {
+            tcp_to_tcp(server, buf, remote.host, self.1, self.2).await;
         } else {
-            tcp_to_tls(server, buf, remote, self.1, self.2).await;
+            tcp_to_tls(server, buf, remote.host, self.1, self.2).await;
         }
     }
 
-    async fn tls(self, mut server: TlsStream<TcpStream>) {
+    async fn tls(mut self, mut server: TlsStream<TcpStream>) {
         trace!("Procedure start");
         let mut buf = Vec::<u8>::with_capacity(CAPACITY);
         async_ext_start!(server, buf);
         if buf.len() == 0 {
             return;
         }
-        let (protoc, remote, _n) = match self.0.get(&mut buf).await {
+        let remote = match self.0.get(&mut buf).await {
             Some(r) => r,
             None => {
                 warn!("no remote");
                 return;
             }
         };
-        debug!("remote[{:?}]", remote);
-        if protoc == Protoc::TCP {
-            tls_to_tcp(server, buf, remote, self.1, self.2).await;
+        debug!("remote[{:?}]", remote.host);
+        if remote.protoc == Protoc::TCP {
+            tls_to_tcp(server, buf, remote.host, self.1, self.2).await;
         } else {
-            tls_to_tls(server, buf, remote, self.1, self.2).await;
+            tls_to_tls(server, buf, remote.host, self.1, self.2).await;
         }
     }
 }
@@ -123,8 +122,8 @@ async fn tcp_to_tcp(
     mut server: TcpStream,
     mut buf: Vec<u8>,
     remote: String,
-    server_data_func: impl FuncR,
-    remote_data_func: impl FuncR,
+    mut server_data_func: impl FuncR,
+    mut remote_data_func: impl FuncR,
 ) {
     trace!("tcp_to_tcp");
 
@@ -171,8 +170,8 @@ async fn tcp_to_tls(
     mut server: TcpStream,
     mut buf: Vec<u8>,
     remote: String,
-    server_data_func: impl FuncR,
-    remote_data_func: impl FuncR,
+    mut server_data_func: impl FuncR,
+    mut remote_data_func: impl FuncR,
 ) {
     trace!("tcp_to_tls");
 
@@ -218,8 +217,8 @@ async fn tls_to_tcp(
     mut server: TlsStream<TcpStream>,
     mut buf: Vec<u8>,
     remote: String,
-    server_data_func: impl FuncR,
-    remote_data_func: impl FuncR,
+    mut server_data_func: impl FuncR,
+    mut remote_data_func: impl FuncR,
 ) {
     trace!("tls_to_tcp");
 
@@ -265,8 +264,8 @@ async fn tls_to_tls(
     mut server: TlsStream<TcpStream>,
     mut buf: Vec<u8>,
     remote: String,
-    server_data_func: impl FuncR,
-    remote_data_func: impl FuncR,
+    mut server_data_func: impl FuncR,
+    mut remote_data_func: impl FuncR,
 ) {
     trace!("tls_to_tls");
 
@@ -308,7 +307,7 @@ async fn tls_to_tls(
 
 async fn handle<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut server: S, func: impl FuncRw) {
     loop {
-        let func = func.clone();
+        let mut func = func.clone();
 
         let mut r_buf = Vec::<u8>::with_capacity(CAPACITY);
         let mut w_buf = Vec::<u8>::with_capacity(CAPACITY);
