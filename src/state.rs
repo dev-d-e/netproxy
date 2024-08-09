@@ -35,14 +35,14 @@ impl ServerState {
 #[derive(Debug)]
 pub(crate) struct ServerControl {
     server: String,
-    rx: Vec<oneshot::Receiver<u8>>,
+    rx: Option<oneshot::Receiver<u8>>,
     ip_scope: Vec<String>,
 }
 
 #[async_trait]
 impl FuncControl for ServerControl {
     fn stop_receiver(&mut self) -> oneshot::Receiver<u8> {
-        if let Some(rx) = self.rx.pop() {
+        if let Some(rx) = self.rx.take() {
             rx
         } else {
             let (_, rx) = oneshot::channel();
@@ -74,7 +74,7 @@ impl ServerControl {
     pub(crate) fn new(server: String, rx: oneshot::Receiver<u8>) -> Self {
         ServerControl {
             server,
-            rx: vec![rx],
+            rx: Some(rx),
             ip_scope: Vec::new(),
         }
     }
