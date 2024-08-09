@@ -1,4 +1,3 @@
-#[macro_export]
 macro_rules! tcp_stream_start {
     ($reader:ident, $buf:ident) => {
         let _ = $reader.readable().await;
@@ -25,7 +24,6 @@ macro_rules! tcp_stream_start {
     };
 }
 
-#[macro_export]
 macro_rules! tcp_stream_read {
     ($reader:ident, $buf:ident, $func:ident, $wr:ident, $state:ident, $str:literal) => {
         loop {
@@ -71,7 +69,6 @@ macro_rules! tcp_stream_read {
     };
 }
 
-#[macro_export]
 macro_rules! async_ext_start {
     ($reader:ident, $buf:ident) => {
         match $reader.read_buf(&mut $buf).await {
@@ -89,7 +86,6 @@ macro_rules! async_ext_start {
     };
 }
 
-#[macro_export]
 macro_rules! async_ext_read {
     ($read:ident, $buf:ident, $func:ident, $wr:ident, $state:ident, $str:literal) => {
         match $read {
@@ -130,7 +126,6 @@ macro_rules! async_ext_read {
     };
 }
 
-#[macro_export]
 macro_rules! async_ext_rw {
     ($server:ident, $r_buf:ident, $w_buf:ident, $func:ident, $state:ident) => {
         loop {
@@ -138,9 +133,8 @@ macro_rules! async_ext_rw {
                 Ok(n) => {
                     trace!("async_ext_rw {}", n);
                     if n > 0 {
-                        let func = $func.clone();
                         if $r_buf.len() > 0 {
-                            func.service(&mut $r_buf, &mut $w_buf).await;
+                            $func.service(&mut $r_buf, &mut $w_buf).await;
                             $r_buf.clear();
                         }
                         if $w_buf.len() > 0 {
