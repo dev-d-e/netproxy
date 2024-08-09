@@ -1,7 +1,6 @@
 use crate::args::*;
 use crate::core::*;
 use crate::route::{self, Transfer};
-use crate::rw_service;
 use crate::state;
 use crate::visit::{self, Visit};
 use async_trait::async_trait;
@@ -330,7 +329,9 @@ async fn take_effect(ct: CfgType, v: Vec<String>) -> Result<String, u8> {
 async fn to_transfer(v: Vec<String>) -> Result<Transfer, u8> {
     let (p1, p2) = two_protoc(&v[0]).await?;
 
-    let (ra, proportion) = some_addr_proportion(&v)?;
+    let (ra, mut proportion) = some_addr_proportion(&v)?;
+
+    divide(&mut proportion);
 
     Ok(Transfer {
         server_protoc: p1,
@@ -428,7 +429,7 @@ pub(crate) fn build(args: Args) {
             .push_str(&server.addr.to_string());
         ip_scope().await.lock().await.extend_from_slice(&ipscope);
 
-        let pd = ProcedureService::new(Service);
+        let pd = ProcedureService::new(Service::new(server.addr));
 
         let (tx, mut sc) = state::no_hold().await;
         current_tx().await.lock().await.push(tx);
@@ -453,7 +454,7 @@ pub(crate) fn build(args: Args) {
             spawn_tool(server.addr.to_string(), true);
         }
 
-        let pd = ProcedureService::new(Service);
+        let pd = ProcedureService::new(Service::new(server.addr));
 
         let (tx, mut sc) = state::no_hold().await;
         current_tx().await.lock().await.push(tx);
@@ -470,8 +471,23 @@ pub(crate) fn build(args: Args) {
     });
 }
 
-rw_service!(Service, self, req, rsp, {
-    let str = into_str(req);
-    req.clear();
-    rsp.extend_from_slice(handle_cfg(str).await.as_bytes());
-});
+#[derive(Clone, Debug)]
+struct Service {
+    host: SocketAddr,
+}
+
+#[async_trait]
+impl FuncRw for Service {
+    async fn service(&mut self, req: &mut Vec<u8>, rsp: &mut Vec<u8>) {
+        let str = into_str(req);
+        req.clear();
+        trace!("[{:?}]cfg:{:?}", &self.host, str);
+        rsp.extend_from_slice(handle_cfg(str).await.as_bytes());
+    }
+}
+
+impl Service {
+    fn new(host: SocketAddr) -> Self {
+        Self { host }
+    }
+}
