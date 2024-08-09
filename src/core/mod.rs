@@ -1,9 +1,10 @@
+#[macro_use]
+mod rw;
 mod cert;
 mod hr;
 mod pd;
 mod pdtrait;
 mod rt;
-mod rw;
 mod sv;
 
 pub(crate) use cert::{build_certificate_from_file, build_certificate_from_socket, valid_identity};
@@ -24,6 +25,17 @@ pub(crate) enum Protoc {
     UDP,
     HTTP,
     HTTPPT,
+}
+
+pub(crate) struct Remote {
+    pub(crate) protoc: Protoc,
+    pub(crate) host: String,
+}
+
+impl Remote {
+    pub(crate) fn new(protoc: Protoc, host: String) -> Self {
+        Self { protoc, host }
+    }
 }
 
 struct StrWrapper(String);
@@ -91,4 +103,47 @@ pub(crate) fn now_str() -> String {
         date_time.truncate(19);
     }
     date_time
+}
+
+pub(crate) fn divide(v: &mut Vec<usize>) {
+    let mut d = 1;
+    let mut iter = v.windows(2);
+    while let Some(o) = iter.next() {
+        let i = co_divisor(o[0], o[1]);
+        if i <= 1 {
+            d = 1;
+            break;
+        }
+        if i < d || d <= 1 {
+            d = i;
+        }
+    }
+    while d > 1 {
+        if v.iter().any(|n| *n % d != 0) {
+            d -= 1;
+        } else {
+            break;
+        }
+    }
+    if d > 1 {
+        v.iter_mut().for_each(|n| *n /= d)
+    }
+}
+
+//calculate common divisor.
+fn co_divisor(a: usize, b: usize) -> usize {
+    let c = a % b;
+    if c == 0 {
+        b
+    } else {
+        co_divisor(b, c)
+    }
+}
+
+#[test]
+fn test() {
+    println!("now: {:?}", now_str());
+    let mut v = vec![2, 4, 6];
+    divide(&mut v);
+    assert_eq!(v, [1, 2, 3]);
 }
