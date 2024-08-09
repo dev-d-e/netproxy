@@ -1,13 +1,10 @@
 use super::*;
-use crate::{route_alg, transfer_data};
-use async_trait::async_trait;
 use log::{debug, error, trace};
 
-route_alg!(
-    RouteAlg,
-    self,
-    buf,
-    {
+struct RouteAlg(Vec<String>, usize, Vec<usize>);
+
+impl FuncRouteAlg for RouteAlg {
+    fn addr(&mut self, buf: &mut Vec<u8>) -> Option<String> {
         let _req = match parse_request(buf) {
             Ok(req) => req,
             Err(e) => {
@@ -19,13 +16,8 @@ route_alg!(
         let s = self.0[self.2[self.1]].clone();
         self.1 = (self.1 + 1) % self.2.len();
         Some(s)
-    },
-    Vec<String>,
-    usize,
-    Vec<usize>
-);
-
-transfer_data!(Empty, self, _buf, {}, {});
+    }
+}
 
 async fn http_to_http(tf: Transfer) {
     trace!("http_to_http");
@@ -48,7 +40,11 @@ async fn http_to_http(tf: Transfer) {
     let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-    let pd = Procedure::new(RouteFinder::new(ra, Protoc::TLS), Empty, Empty);
+    let pd = Procedure::new(
+        RouteFinder::new(ra, Protoc::TLS),
+        RouteR::new(),
+        RouteR::new(),
+    );
     server.tls(pd, i, sc).await;
 }
 
@@ -73,7 +69,11 @@ async fn http_to_http_pt(tf: Transfer) {
     let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-    let pd = Procedure::new(RouteFinder::new(ra, Protoc::TCP), Empty, Empty);
+    let pd = Procedure::new(
+        RouteFinder::new(ra, Protoc::TCP),
+        RouteR::new(),
+        RouteR::new(),
+    );
     server.tls(pd, i, sc).await;
 }
 
@@ -90,7 +90,11 @@ async fn http_pt_to_http(tf: Transfer) {
     let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-    let pd = Procedure::new(RouteFinder::new(ra, Protoc::TLS), Empty, Empty);
+    let pd = Procedure::new(
+        RouteFinder::new(ra, Protoc::TLS),
+        RouteR::new(),
+        RouteR::new(),
+    );
     server.tcp(pd, sc).await;
 }
 
@@ -107,7 +111,11 @@ async fn http_pt_to_http_pt(tf: Transfer) {
     let sc = state::hold(server.addr.to_string()).await;
 
     let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-    let pd = Procedure::new(RouteFinder::new(ra, Protoc::TCP), Empty, Empty);
+    let pd = Procedure::new(
+        RouteFinder::new(ra, Protoc::TCP),
+        RouteR::new(),
+        RouteR::new(),
+    );
     server.tcp(pd, sc).await;
 }
 
