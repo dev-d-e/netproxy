@@ -2,7 +2,6 @@ mod http;
 
 use crate::core::*;
 use crate::state;
-use crate::transfer_data;
 use async_trait::async_trait;
 use log::{debug, error, trace};
 use std::sync::Arc;
@@ -12,42 +11,28 @@ pub(crate) trait FuncRouteAlg: Send + Sync + 'static {
     fn addr(&mut self, buf: &mut Vec<u8>) -> Option<String>;
 }
 
-#[macro_export]
-macro_rules! route_alg {
-    ($name:ident, $self:ident, $buf:ident, $func:stmt, $($ty:ty),*) => {
-        struct $name($($ty),*);
+struct RouteFinder(Arc<Mutex<dyn FuncRouteAlg>>, Protoc);
 
-        impl FuncRouteAlg for $name {
-            fn addr(&mut $self, $buf: &mut Vec<u8>) -> Option<String> {
-                $func
-            }
-        }
-    };
-}
-
-#[derive(Debug)]
-struct RouteFinder<T: FuncRouteAlg>(Arc<Mutex<T>>, Protoc);
-
-impl<T: FuncRouteAlg> Clone for RouteFinder<T> {
+impl Clone for RouteFinder {
     fn clone(&self) -> Self {
         RouteFinder(Arc::clone(&self.0), self.1.clone())
     }
 }
 
 #[async_trait]
-impl<T: FuncRouteAlg> FuncRemote for RouteFinder<T> {
-    async fn get(&self, buf: &mut Vec<u8>) -> Option<(Protoc, String, u32)> {
+impl FuncRemote for RouteFinder {
+    async fn get(&mut self, buf: &mut Vec<u8>) -> Option<Remote> {
         let mut lock = self.0.lock().await;
         let addr = lock.addr(buf);
         drop(lock);
         let s = addr?;
         trace!("RouteFinder get:({:?})", s);
-        Some((self.1.clone(), s, 0))
+        Some(Remote::new(self.1.clone(), s))
     }
 }
 
-impl<T: FuncRouteAlg> RouteFinder<T> {
-    fn new(a: T, p: Protoc) -> Self {
+impl RouteFinder {
+    fn new(a: impl FuncRouteAlg, p: Protoc) -> Self {
         RouteFinder(Arc::new(Mutex::new(a)), p)
     }
 }
@@ -84,21 +69,41 @@ fn get_index(mut v: Vec<usize>) -> Vec<usize> {
     v
 }
 
-route_alg!(
-    RouteAlg,
-    self,
-    _buf,
-    {
+struct RouteAlg(Vec<String>, usize, Vec<usize>);
+
+impl FuncRouteAlg for RouteAlg {
+    fn addr(&mut self, _buf: &mut Vec<u8>) -> Option<String> {
         let s = self.0[self.2[self.1]].clone();
         self.1 = (self.1 + 1) % self.2.len();
         Some(s)
-    },
-    Vec<String>,
-    usize,
-    Vec<usize>
-);
+    }
+}
 
-transfer_data!(Empty, self, _buf, {}, {});
+#[derive(Clone, Debug)]
+pub(crate) struct RouteR {
+    sum: usize,
+}
+
+#[async_trait]
+impl FuncR for RouteR {
+    async fn data(&mut self, buf: &mut Vec<u8>) {
+        self.sum += buf.len();
+    }
+
+    async fn enddata(&mut self, buf: &mut Vec<u8>) {
+        self.sum += buf.len();
+    }
+}
+
+impl RouteR {
+    fn new() -> Self {
+        Self { sum: 0 }
+    }
+
+    fn sum(&self) -> usize {
+        self.sum
+    }
+}
 
 pub(crate) fn start_up(tf: Transfer) {
     debug!("{:?}", tf);
@@ -128,7 +133,7 @@ async fn tcp(tf: Transfer) {
     let protoc = tf.remote_protoc;
     if protoc == Protoc::TCP || protoc == Protoc::TLS {
         let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-        let pd = Procedure::new(RouteFinder::new(ra, protoc), Empty, Empty);
+        let pd = Procedure::new(RouteFinder::new(ra, protoc), RouteR::new(), RouteR::new());
         server.tcp(pd, sc).await;
     }
 }
@@ -156,7 +161,7 @@ async fn tls(tf: Transfer) {
     let protoc = tf.remote_protoc;
     if protoc == Protoc::TCP || protoc == Protoc::TLS {
         let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-        let pd = Procedure::new(RouteFinder::new(ra, protoc), Empty, Empty);
+        let pd = Procedure::new(RouteFinder::new(ra, protoc), RouteR::new(), RouteR::new());
         server.tls(pd, i, sc).await;
     }
 }
