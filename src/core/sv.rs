@@ -71,10 +71,7 @@ impl Server {
         Ok(Server { listener, addr })
     }
 
-    pub(crate) async fn tcp<T>(&mut self, func: T, mut c: impl FuncControl)
-    where
-        T: FuncStream,
-    {
+    pub(crate) async fn tcp(&mut self, func: impl FuncStream, mut c: impl FuncControl) {
         let mut rx = c.stop_receiver();
         let mut n: u32 = 0;
         let mut interval = time::interval(Duration::from_secs(1));
@@ -119,10 +116,12 @@ impl Server {
         }
     }
 
-    pub(crate) async fn tls<T>(&mut self, func: T, identity: Identity, mut c: impl FuncControl)
-    where
-        T: FuncStream,
-    {
+    pub(crate) async fn tls(
+        &mut self,
+        func: impl FuncStream,
+        identity: Identity,
+        mut c: impl FuncControl,
+    ) {
         let tls_acceptor = match get_tls(identity) {
             Ok(tls_acceptor) => tls_acceptor,
             Err(e) => {
