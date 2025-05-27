@@ -5,7 +5,7 @@ struct RouteAlg(Vec<String>, usize, Vec<usize>);
 
 impl FuncRouteAlg for RouteAlg {
     fn addr(&mut self, buf: &mut Vec<u8>) -> Option<String> {
-        let _req = match parse_request(buf) {
+        let _req = match HttpRequest::parse(buf) {
             Ok(req) => req,
             Err(e) => {
                 error!("http request error:{:?}", e);
