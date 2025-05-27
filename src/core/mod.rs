@@ -8,7 +8,7 @@ mod rt;
 mod sv;
 
 pub(crate) use cert::{build_certificate_from_file, build_certificate_from_socket, valid_identity};
-pub(crate) use hr::parse_request;
+pub(crate) use hr::HttpRequest;
 use log::trace;
 pub(crate) use pd::{Procedure, ProcedureService};
 pub(crate) use pdtrait::{FuncR, FuncRemote, FuncRw};
@@ -48,11 +48,11 @@ impl utf8parse::Receiver for StrWrapper {
     fn invalid_sequence(&mut self) {}
 }
 
-pub(crate) fn into_str(buf: &mut Vec<u8>) -> String {
+pub(crate) fn into_str(buf: &[u8]) -> String {
     trace!("into_str:{:?}", buf.len());
     let mut p = utf8parse::Parser::new();
     let mut t = StrWrapper(String::new());
-    for byte in buf.into_iter() {
+    for byte in buf {
         p.advance(&mut t, *byte);
     }
     t.0
