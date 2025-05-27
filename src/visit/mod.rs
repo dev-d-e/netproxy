@@ -9,7 +9,7 @@ struct VisitFinder(Protoc);
 #[async_trait]
 impl FuncRemote for VisitFinder {
     async fn get(&mut self, buf: &mut Vec<u8>) -> Option<Remote> {
-        let mut req = match parse_request(buf) {
+        let mut req = match HttpRequest::parse(buf) {
             Ok(req) => req,
             Err(e) => {
                 error!("http request error:{:?}", e);
