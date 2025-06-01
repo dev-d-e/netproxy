@@ -5,11 +5,8 @@ use crate::state;
 use crate::visit::{self, Visit};
 use async_trait::async_trait;
 use log::{debug, error, trace};
-use regex::Regex;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{Mutex, OnceCell};
 
@@ -22,55 +19,18 @@ const CERTIFICATE: &str = "certificate";
 const STATE: &str = "state";
 const SHUTDOWN: &str = "shutdown";
 
-const KEYWORDS: [(&str, CfgType); 3] = [
-    (CERTIFICATE, CfgType::Certificate),
-    (STATE, CfgType::State),
-    (SHUTDOWN, CfgType::Shutdown),
-];
-
-const PROTOCS: [(&str, Protoc); 5] = [
-    (HTTP, Protoc::HTTP),
-    (HTTP_PT, Protoc::HTTPPT),
-    (TCP, Protoc::TCP),
-    (TLS, Protoc::TLS),
-    (UDP, Protoc::UDP),
-];
-
-const OUTCOMES: [(u8, &str); 8] = [
-    (0, "ok"),
-    (1, "configuration sentences error"),
-    (2, "protocol error"),
-    (3, "SocketAddr error"),
-    (4, "must be certificate sentence"),
-    (5, "certificate error"),
-    (6, "server is starting up..."),
-    (7, "shutdown error"),
+const OUTCOMES: [&str; 8] = [
+    "ok",
+    "configuration sentences error",
+    "protocol error",
+    "SocketAddr error",
+    "must be certificate sentence",
+    "certificate error",
+    "server is starting up...",
+    "shutdown error",
 ];
 
 static mut SAFE: bool = false;
-
-static REGEX_PROTOCOL: OnceCell<Regex> = OnceCell::const_new();
-
-async fn regex_protocol() -> &'static Regex {
-    REGEX_PROTOCOL
-        .get_or_init(|| async {
-            Regex::new(r"^(http|http_pt|tcp|tls|udp)(-(http|http_pt|tcp|tls|udp)|-|)$").unwrap()
-        })
-        .await
-}
-
-static REGEX_VISIT_PROTOCOL: OnceLock<Regex> = OnceLock::new();
-
-fn regex_visit_protocol() -> &'static Regex {
-    REGEX_VISIT_PROTOCOL
-        .get_or_init(|| Regex::new(r"^(http|http_pt)(-(http|http_pt)|-|)$").unwrap())
-}
-
-static REGEX_CERTIFICATE: OnceLock<Regex> = OnceLock::new();
-
-fn regex_certificate() -> &'static Regex {
-    REGEX_CERTIFICATE.get_or_init(|| Regex::new(r"^certificate (f|s) ").unwrap())
-}
 
 static CURRENT_TX: OnceCell<Mutex<Vec<Sender<u8>>>> = OnceCell::const_new();
 
@@ -96,286 +56,185 @@ async fn ip_scope() -> &'static Mutex<Vec<String>> {
         .await
 }
 
-static KW_MAP: OnceCell<Mutex<HashMap<&'static str, CfgType>>> = OnceCell::const_new();
-
-async fn kw_map() -> &'static Mutex<HashMap<&'static str, CfgType>> {
-    KW_MAP
-        .get_or_init(|| async { Mutex::new(HashMap::from(KEYWORDS)) })
-        .await
-}
-
-static P_MAP: OnceCell<Mutex<HashMap<&'static str, Protoc>>> = OnceCell::const_new();
-
-async fn p_map() -> &'static Mutex<HashMap<&'static str, Protoc>> {
-    P_MAP
-        .get_or_init(|| async { Mutex::new(HashMap::from(PROTOCS)) })
-        .await
-}
-
-static OC_MAP: OnceCell<Mutex<HashMap<u8, &'static str>>> = OnceCell::const_new();
-
-async fn oc_map() -> &'static Mutex<HashMap<u8, &'static str>> {
-    OC_MAP
-        .get_or_init(|| async { Mutex::new(HashMap::from(OUTCOMES)) })
-        .await
-}
-
-static CHECKERS: OnceCell<
-    Mutex<HashMap<CfgType, Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>>>,
-> = OnceCell::const_new();
-
-async fn checkers() -> &'static Mutex<
-    HashMap<CfgType, Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>>,
-> {
-    CHECKERS
-        .get_or_init(|| async {
-            let mut map: HashMap<
-                CfgType,
-                Box<dyn (Fn(&str, &Vec<String>) -> bool) + Send + Sync + 'static>,
-            > = HashMap::new();
-            map.insert(
-                CfgType::Transfer,
-                Box::new(|_s, v| {
-                    if v.len() > 2 {
-                        if let Ok(_) = v[1].parse::<SocketAddr>() {
-                            trace!("transfer configuration");
-                            return true;
-                        }
-                    }
-                    false
-                }),
-            );
-            map.insert(
-                CfgType::Visit,
-                Box::new(|_s, v| {
-                    if v.len() == 2 && regex_visit_protocol().is_match(&v[0]) {
-                        if let Ok(_) = v[1].parse::<SocketAddr>() {
-                            trace!("visit configuration");
-                            return true;
-                        }
-                    }
-                    false
-                }),
-            );
-            map.insert(
-                CfgType::Certificate,
-                Box::new(|s, v| {
-                    if v.len() == 4 && regex_certificate().is_match(s) {
-                        trace!("certificate configuration");
-                        return true;
-                    }
-                    false
-                }),
-            );
-            map.insert(
-                CfgType::State,
-                Box::new(|_s, v| {
-                    let n = v.len();
-                    if n == 1 || n == 2 {
-                        trace!("state configuration");
-                        return true;
-                    }
-                    false
-                }),
-            );
-            map.insert(
-                CfgType::Shutdown,
-                Box::new(|_s, v| {
-                    if v.len() == 2 {
-                        trace!("shutdown configuration");
-                        return true;
-                    }
-                    false
-                }),
-            );
-            Mutex::new(map)
-        })
-        .await
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum CfgType {
-    Transfer,
-    Visit,
-    Certificate,
-    State,
-    Shutdown,
-}
-
-async fn get_outcome(k: u8) -> String {
-    let map = oc_map().await.lock().await;
-    match map.get(&k) {
-        Some(s) => s.to_string(),
-        None => "nothing".to_string(),
+fn to_protoc(s: &str) -> Option<Protoc> {
+    match s {
+        HTTP => Some(Protoc::HTTP),
+        HTTP_PT => Some(Protoc::HTTPPT),
+        TCP => Some(Protoc::TCP),
+        TLS => Some(Protoc::TLS),
+        UDP => Some(Protoc::UDP),
+        _ => None,
     }
+}
+
+async fn send_stop() {
+    unsafe {
+        if SAFE {
+            trace!("CURRENT_TX send");
+            //send stop signal to current server
+            if let Some(tx) = current_tx().await.lock().await.pop() {
+                if let Err(e) = tx.send(0) {
+                    error!("CURRENT_TX send error:{:?}", e);
+                }
+            }
+
+            SAFE = false;
+        }
+    }
+}
+
+macro_rules! check_safe {
+    () => {
+        unsafe {
+            if SAFE {
+                return OUTCOMES[4].to_string();
+            }
+        }
+    };
 }
 
 async fn handle_cfg(str: String) -> String {
-    match check(&str).await {
-        Ok((ct, v)) => {
-            trace!("handle configuration: {:?} {:?}", ct, v);
-            unsafe {
-                if SAFE && ct != CfgType::Certificate {
-                    return get_outcome(4).await;
-                }
+    match RuleType::from(str) {
+        RuleType::Transfer(o) => {
+            check_safe!();
+            route::start_up(o);
+            return OUTCOMES[6].to_string();
+        }
+        RuleType::Visit(o) => {
+            check_safe!();
+            visit::start_up(o);
+            return OUTCOMES[6].to_string();
+        }
+        RuleType::CertificateF(a, b) => {
+            if let Err(e) = build_certificate_from_file(a, b).await {
+                error!("certificate error:{:?}", e);
+                return OUTCOMES[5].to_string();
             }
-            match take_effect(ct, v).await {
-                Ok(s) => {
-                    let mut ss = String::from("ok ");
-                    ss.push_str(&s);
-                    return ss;
-                }
-                Err(e) => return get_outcome(e).await,
+            send_stop().await;
+            return OUTCOMES[0].to_string();
+        }
+        RuleType::CertificateS(a, b) => {
+            if let Err(e) = build_certificate_from_socket(a, b).await {
+                error!("certificate error:{:?}", e);
+                return OUTCOMES[5].to_string();
+            }
+            send_stop().await;
+            return OUTCOMES[0].to_string();
+        }
+        RuleType::State(o) => {
+            check_safe!();
+            if let Some(o) = o {
+                return state::state_string(&o).await;
+            } else {
+                return state::list().await;
             }
         }
-        Err(e) => return get_outcome(e).await,
-    };
-}
-
-async fn check(str: &str) -> Result<(CfgType, Vec<String>), u8> {
-    let v: Vec<String> = str.split_whitespace().map(|s| s.to_string()).collect();
-    let n = v.len();
-    trace!("configuration check");
-    if n > 0 {
-        let ct = if regex_protocol().await.is_match(&v[0]) {
-            if n > 2 {
-                CfgType::Transfer
-            } else if n == 2 {
-                CfgType::Visit
-            } else {
-                return Err(1);
+        RuleType::Shutdown(o) => {
+            check_safe!();
+            if !state::shutdown(&o).await {
+                return OUTCOMES[7].to_string();
             }
-        } else {
-            let map = kw_map().await.lock().await;
-            match map.get(v[0].as_str()) {
-                Some(ct) => ct.clone(),
-                None => return Err(1),
-            }
-        };
-        let map = checkers().await.lock().await;
-        if let Some(checker) = map.get(&ct) {
-            if checker(str, &v) {
-                trace!("pass");
-                return Ok((ct, v));
-            }
+            return OUTCOMES[0].to_string();
+        }
+        RuleType::None(n) => {
+            check_safe!();
+            return OUTCOMES[n as usize].to_string();
         }
     }
-    Err(1)
 }
 
-async fn take_effect(ct: CfgType, v: Vec<String>) -> Result<String, u8> {
-    match ct {
-        CfgType::Transfer => {
-            let tf = to_transfer(v).await?;
-            route::start_up(tf);
-            return Err(6);
-        }
-        CfgType::Visit => {
-            let vi = to_visit(v).await?;
-            visit::start_up(vi);
-            return Err(6);
-        }
-        CfgType::Certificate => {
-            match v[1].as_str() {
-                "f" => {
-                    if let Err(e) = build_certificate_from_file(v[2].clone(), v[3].clone()).await {
-                        error!("certificate error:{:?}", e);
-                        return Err(5);
+enum RuleType {
+    Transfer(Transfer),
+    Visit(Visit),
+    CertificateF(String, String),
+    CertificateS(String, String),
+    State(Option<String>),
+    Shutdown(String),
+    None(u8),
+}
+
+impl RuleType {
+    pub(crate) fn from(s: String) -> Self {
+        trace!("configuration check");
+        let mut iter = s.split_whitespace();
+        if let Some(a) = iter.next() {
+            match a {
+                CERTIFICATE => {
+                    if let Some(b) = iter.next() {
+                        if let Some(c) = iter.next() {
+                            if let Some(d) = iter.next() {
+                                match b {
+                                    "f" => {
+                                        trace!("certificate configuration");
+                                        return Self::CertificateF(c.to_string(), d.to_string());
+                                    }
+                                    "s" => {
+                                        trace!("certificate configuration");
+                                        return Self::CertificateS(c.to_string(), d.to_string());
+                                    }
+                                    _ => {
+                                        return Self::None(5);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                "s" => {
-                    if let Err(e) = build_certificate_from_socket(v[2].clone(), v[3].clone()).await
-                    {
-                        error!("certificate error:{:?}", e);
-                        return Err(5);
+                STATE => {
+                    trace!("state configuration");
+                    return Self::State(iter.next().map(|s| s.to_string()));
+                }
+                SHUTDOWN => {
+                    if let Some(b) = iter.next() {
+                        trace!("shutdown configuration");
+                        return Self::Shutdown(b.to_string());
                     }
                 }
                 _ => {
-                    return Err(5);
-                }
-            }
-            unsafe {
-                if SAFE {
-                    trace!("CURRENT_TX send");
-                    //send stop signal to current server
-                    if let Some(tx) = current_tx().await.lock().await.pop() {
-                        if let Err(e) = tx.send(0) {
-                            error!("CURRENT_TX send error:{:?}", e);
+                    //accept protocol and route target protocol, split by '-', if only one,the other is the same.
+                    let (p1, p2) = a.split_once('-').unwrap_or((a, a));
+                    if let Some(p1) = to_protoc(p1) {
+                        if let Some(p2) = to_protoc(p2) {
+                            if let Some(b) = iter.next() {
+                                if b.parse::<SocketAddr>().is_err() {
+                                    return Self::None(3);
+                                }
+                                if let Some(c) = iter.next() {
+                                    trace!("transfer configuration");
+                                    let (ra, mut proportion) =
+                                        some_addr_proportion(c, iter.next()).unwrap();
+                                    divide(&mut proportion);
+                                    let o = Transfer {
+                                        server_protoc: p1,
+                                        server_addr: b.to_string(),
+                                        remote_protoc: p2,
+                                        remote_addrs: ra,
+                                        proportion,
+                                    };
+                                    return Self::Transfer(o);
+                                } else {
+                                    trace!("visit configuration");
+                                    let o = Visit {
+                                        server_protoc: p1,
+                                        server_addr: b.to_string(),
+                                        remote_protoc: p2,
+                                    };
+                                    return Self::Visit(o);
+                                }
+                            }
                         }
                     }
-
-                    SAFE = false;
                 }
             }
         }
-        CfgType::State => {
-            if v.len() == 1 {
-                let s = state::list().await;
-                return Ok(s);
-            } else if v.len() == 2 {
-                let s = state::state_string(&v[1]).await;
-                return Ok(s);
-            }
-        }
-        CfgType::Shutdown => {
-            if !state::shutdown(&v[1]).await {
-                return Err(7);
-            }
-        }
-    }
-    Err(0)
-}
-
-async fn to_transfer(v: Vec<String>) -> Result<Transfer, u8> {
-    let (p1, p2) = two_protoc(&v[0]).await?;
-
-    let (ra, mut proportion) = some_addr_proportion(&v)?;
-
-    divide(&mut proportion);
-
-    Ok(Transfer {
-        server_protoc: p1,
-        server_addr: v[1].clone(),
-        remote_protoc: p2,
-        remote_addrs: ra,
-        proportion,
-    })
-}
-
-async fn to_visit(v: Vec<String>) -> Result<Visit, u8> {
-    let (p1, p2) = two_protoc(&v[0]).await?;
-
-    Ok(Visit {
-        server_protoc: p1,
-        server_addr: v[1].clone(),
-        remote_protoc: p2,
-    })
-}
-
-//accept protocol and route target protocol, split by '-', if only one,the other is the same.
-async fn two_protoc(str: &str) -> Result<(Protoc, Protoc), u8> {
-    let pv: Vec<&str> = str.split('-').collect();
-    let p1 = to_protoc(pv[0]).await?;
-    let p2 = if pv.len() > 1 {
-        to_protoc(pv[1]).await?
-    } else {
-        p1.clone()
-    };
-    Ok((p1, p2))
-}
-
-async fn to_protoc(str: &str) -> Result<Protoc, u8> {
-    let map = p_map().await.lock().await;
-    match map.get(&str) {
-        Some(p) => Ok(p.clone()),
-        None => Err(2),
+        Self::None(1)
     }
 }
 
 //target socket addr, one or several, where data transfer to, split by ','
 //proportion of data transfer to target, split by ':'. it's digit and correspondence with third. if it's not digit, replace with 0. if number is less than socket addrs, fill with 1. it can be omitted.
-fn some_addr_proportion(v: &Vec<String>) -> Result<(Vec<String>, Vec<usize>), u8> {
-    let addr: Vec<String> = v[2].split(',').map(|s| s.to_string()).collect();
+fn some_addr_proportion(a: &str, p: Option<&str>) -> Result<(Vec<String>, Vec<usize>), u8> {
+    let addr: Vec<String> = a.split(',').map(|s| s.to_string()).collect();
     if addr
         .iter()
         .find(|s| s.parse::<SocketAddr>().is_err())
@@ -383,8 +242,8 @@ fn some_addr_proportion(v: &Vec<String>) -> Result<(Vec<String>, Vec<usize>), u8
     {
         return Err(3);
     }
-    let proportion: Vec<usize> = if v.len() > 3 {
-        let mut p: Vec<usize> = v[3].split(':').map(|s| s.parse().unwrap_or(0)).collect();
+    let proportion: Vec<usize> = if let Some(p) = p {
+        let mut p: Vec<usize> = p.split(':').map(|s| s.parse().unwrap_or(0)).collect();
         if p.len() < addr.len() {
             p.extend_from_slice(&[addr.len() - p.len(); 1]);
         } else if p.len() > addr.len() {
