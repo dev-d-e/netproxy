@@ -105,6 +105,7 @@ pub(crate) async fn hold(server: String) -> ServerControl {
 pub(crate) async fn list() -> String {
     let map = server_state().await.lock().await;
     let mut str = String::new();
+    str.push_str("ok ");
     for (key, val) in map.iter() {
         str.push_str(key);
         str.push_str(",velocity:");
@@ -124,6 +125,7 @@ pub(crate) async fn list() -> String {
 pub(crate) async fn state_string(server: &String) -> String {
     let map = server_state().await.lock().await;
     let mut str = String::new();
+    str.push_str("ok ");
     if let Some(ss) = map.get(server) {
         str.push_str(&ss.server);
         str.push_str(",velocity:");
