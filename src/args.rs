@@ -1,5 +1,6 @@
 use clap::Parser;
 use log::error;
+use std::net::{IpAddr, SocketAddr};
 use std::process::{Child, Command};
 use std::sync::{Mutex, OnceLock};
 
@@ -7,21 +8,21 @@ const YES: &str = "yes";
 
 const NO: &str = "no";
 
-static CHILD: OnceLock<Mutex<Vec<Child>>> = OnceLock::new();
+static CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 
-fn child_vec() -> &'static Mutex<Vec<Child>> {
-    CHILD.get_or_init(|| Mutex::new(Vec::new()))
+fn child_mut() -> &'static Mutex<Option<Child>> {
+    CHILD.get_or_init(|| Mutex::new(None))
 }
 
 fn add_child(c: Child) {
-    if let Ok(mut v) = child_vec().lock() {
-        v.push(c);
+    if let Ok(mut v) = child_mut().lock() {
+        v.replace(c);
     }
 }
 
 fn get_child() -> Option<Child> {
-    if let Ok(mut v) = child_vec().lock() {
-        v.pop()
+    if let Ok(mut v) = child_mut().lock() {
+        v.take()
     } else {
         None
     }
@@ -49,7 +50,7 @@ pub(crate) struct Args {
 }
 
 impl Args {
-    pub(crate) fn socket(&self) -> &String {
+    pub(crate) fn socket(&self) -> &str {
         &self.socket
     }
 
@@ -61,8 +62,11 @@ impl Args {
         NO != self.socsafe
     }
 
-    pub(crate) fn ipscope(&self) -> Vec<String> {
-        self.ipscope.split(',').map(|s| s.to_string()).collect()
+    pub(crate) fn ipscope(&self) -> Vec<IpAddr> {
+        self.ipscope
+            .split(',')
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .collect()
     }
 }
 
@@ -70,34 +74,21 @@ pub(crate) fn init() -> Args {
     Args::parse()
 }
 
-pub(crate) fn spawn_tool(s: String, safe: bool) {
-    if safe {
-        std::thread::spawn(move || {
-            match Command::new("./cfgtool")
-                .arg("-t")
-                .arg(s)
-                .arg("--socsafe")
-                .arg(YES)
-                .spawn()
-            {
-                Ok(process) => add_child(process),
-                Err(e) => error!("fail to spawn 'cfgtool': {}", e),
-            };
-        });
-    } else {
-        std::thread::spawn(move || {
-            match Command::new("./cfgtool")
-                .arg("-t")
-                .arg(s)
-                .arg("--socsafe")
-                .arg(NO)
-                .spawn()
-            {
-                Ok(process) => add_child(process),
-                Err(e) => error!("fail to spawn 'cfgtool': {}", e),
-            };
-        });
-    }
+pub(crate) fn spawn_tool(addr: &SocketAddr, safe: bool) {
+    let s = addr.to_string();
+    let socsafe = if safe { YES } else { NO };
+    std::thread::spawn(move || {
+        match Command::new("./cfgtool")
+            .arg("-t")
+            .arg(s)
+            .arg("--socsafe")
+            .arg(socsafe)
+            .spawn()
+        {
+            Ok(process) => add_child(process),
+            Err(e) => error!("fail to spawn 'cfgtool': {}", e),
+        };
+    });
 }
 
 pub(crate) fn close_tool() {
