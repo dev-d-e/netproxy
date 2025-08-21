@@ -1,178 +1,84 @@
-macro_rules! tcp_stream_start {
-    ($reader:ident, $buf:ident) => {
-        let _ = $reader.readable().await;
-        loop {
-            match $reader.try_read_buf(&mut $buf) {
-                Ok(n) => {
-                    trace!("tcp_stream_start {}", n);
-                    if n == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        debug!("tcp_stream_start WouldBlock");
-                        break;
-                    } else {
-                        error!("tcp_stream_start error: {:?}", e);
-                        break;
-                    }
-                }
-            }
-        }
-    };
+use getset::{CopyGetters, MutGetters};
+use log::{debug, error, trace};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const CAPACITY: usize = 8192;
+
+#[derive(CopyGetters, MutGetters)]
+pub(crate) struct BufStream<T>
+where
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    stream: T,
+    #[getset(get_mut = "pub(crate)")]
+    r_buf: Vec<u8>,
+    #[getset(get_mut = "pub(crate)")]
+    w_buf: Vec<u8>,
+    #[getset(get_copy = "pub(crate)")]
+    r_f: bool,
+    #[getset(get_copy = "pub(crate)")]
+    w_f: bool,
 }
 
-macro_rules! tcp_stream_read {
-    ($reader:ident, $buf:ident, $func:ident, $wr:ident, $state:ident, $str:literal) => {
-        loop {
-            match $reader.try_read_buf(&mut $buf) {
-                Ok(n) => {
-                    trace!("{} tcp_stream_read {}", $str, n);
-                    if n > 0 {
-                        $func.data(&mut $buf).await;
-                        if let Err(e) = $wr.write_all(&$buf).await {
-                            error!("{} write error: {:?}", $str, e);
-                            $state.2 = true;
-                        }
-                        $buf.clear();
-                        continue;
-                    } else {
-                        $state.0 = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        debug!("{} tcp_stream_read WouldBlock", $str);
-                        $state.1 = true;
-                        break;
-                    } else {
-                        error!("{} tcp_stream_read error: {:?}", $str, e);
-                        $state.0 = true;
-                        break;
-                    }
-                }
-            }
+impl<T> BufStream<T>
+where
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    pub(crate) fn new(stream: T) -> Self {
+        Self {
+            stream,
+            r_buf: Vec::with_capacity(CAPACITY),
+            w_buf: Vec::with_capacity(CAPACITY),
+            r_f: false,
+            w_f: false,
         }
-        if $state.0 || $state.1 {
-            $func.enddata(&mut $buf).await;
-        }
-        if $buf.len() > 0 {
-            if let Err(e) = $wr.write_all(&$buf).await {
-                $state.2 = true;
-                error!("{} write error: {:?}", $str, e);
-            }
-            $buf.clear();
-        }
-    };
-}
+    }
 
-macro_rules! async_ext_start {
-    ($reader:ident, $buf:ident) => {
-        match $reader.read_buf(&mut $buf).await {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.r_buf.is_empty()
+    }
+
+    pub(crate) fn has_remaining(&self) -> bool {
+        self.r_buf.len() > 0
+    }
+
+    pub(crate) async fn read(&mut self) {
+        match self.stream.read_buf(&mut self.r_buf).await {
+            Ok(0) => {
+                debug!("read 0 bytes");
+                self.r_f = true;
+            }
             Ok(n) => {
-                trace!("async_ext_start {}", n);
+                trace!("read {} bytes", n);
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                    debug!("async_ext_start WouldBlock");
+                    debug!("read WouldBlock");
                 } else {
-                    error!("async_ext_start error: {:?}", e);
+                    error!("read error: {:?}", e);
+                    self.r_f = true;
                 }
             }
         }
-    };
-}
+    }
 
-macro_rules! async_ext_read {
-    ($read:ident, $buf:ident, $func:ident, $wr:ident, $state:ident, $str:literal) => {
-        match $read {
-            Ok(n) => {
-                trace!("{} async_ext_read {}", $str, n);
-                if n > 0 {
-                    $func.data(&mut $buf).await;
-                    if let Err(e) = $wr.write_all(&$buf).await {
-                        error!("{} write error: {:?}", $str, e);
-                        $state.2 = true;
-                    }
-                    $buf.clear();
-                } else {
-                    $state.0 = true;
-                }
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    debug!("{} async_ext_read WouldBlock", $str);
-                    $state.1 = true;
-                } else {
-                    error!("{} async_ext_read error:{:?}", $str, e);
-                    $state.0 = true;
-                }
-            }
+    pub(crate) async fn write(&mut self, o: Vec<u8>) {
+        if let Err(e) = self.stream.write_all(&o).await {
+            error!("write error: {:?}", e);
+            self.w_f = true;
         }
+    }
 
-        if $state.0 || $state.1 {
-            $func.enddata(&mut $buf).await;
-        }
-        if $buf.len() > 0 {
-            if let Err(e) = $wr.write_all(&$buf).await {
-                error!("{} write error: {:?}", $str, e);
-                $state.2 = true;
-            }
-            $buf.clear();
-        }
-    };
-}
+    pub(crate) fn take_buf(&mut self) -> Vec<u8> {
+        std::mem::replace(&mut self.r_buf, Vec::with_capacity(CAPACITY))
+    }
 
-macro_rules! async_ext_rw {
-    ($server:ident, $r_buf:ident, $w_buf:ident, $func:ident, $state:ident) => {
-        loop {
-            match $server.read_buf(&mut $r_buf).await {
-                Ok(n) => {
-                    trace!("async_ext_rw {}", n);
-                    if n > 0 {
-                        if $r_buf.len() > 0 {
-                            $func.service(&mut $r_buf, &mut $w_buf).await;
-                            $r_buf.clear();
-                        }
-                        if $w_buf.len() > 0 {
-                            if let Err(e) = $server.write_all(&$w_buf).await {
-                                error!("async_ext_rw write error: {:?}", e);
-                                $state.2 = true;
-                            }
-                            $w_buf.clear();
-                        }
-                        continue;
-                    } else {
-                        $state.0 = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        debug!("async_ext_rw WouldBlock");
-                        $state.1 = true;
-                        break;
-                    } else {
-                        error!("async_ext_rw read error:{:?}", e);
-                        $state.0 = true;
-                        break;
-                    }
-                }
+    pub(crate) async fn write_buf(&mut self) {
+        if self.w_buf.len() > 0 {
+            if let Err(e) = self.stream.write_all(self.w_buf.drain(..).as_slice()).await {
+                error!("write error: {:?}", e);
+                self.w_f = true;
             }
         }
-        if $r_buf.len() > 0 {
-            $func.service(&mut $r_buf, &mut $w_buf).await;
-            $r_buf.clear();
-        }
-        if $w_buf.len() > 0 {
-            if let Err(e) = $server.write_all(&$w_buf).await {
-                error!("async_ext_rw write error: {:?}", e);
-                $state.2 = true;
-            }
-            $w_buf.clear();
-        }
-    };
+    }
 }
