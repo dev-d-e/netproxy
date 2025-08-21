@@ -1,57 +1,67 @@
 use crate::core::*;
-use crate::state;
+use crate::state::*;
 use async_trait::async_trait;
-use log::{debug, error};
+use getset::CopyGetters;
+use log::{debug, error, trace, warn};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_native_tls::TlsAcceptor;
 
 #[derive(Clone, Debug)]
 struct VisitFinder(Protoc);
 
-#[async_trait]
-impl FuncRemote for VisitFinder {
+impl VisitFinder {
     async fn get(&mut self, buf: &mut Vec<u8>) -> Option<Remote> {
-        let mut req = match HttpRequest::parse(buf) {
-            Ok(req) => req,
-            Err(e) => {
-                error!("http request error:{:?}", e);
-                return None;
-            }
-        };
-        let mut host = req.get_host();
+        let mut req = HttpRequest::parse(buf)
+            .inspect_err(|e| {
+                error!("http request:{:?}", e);
+                warn!("no remote");
+            })
+            .ok()?;
+
+        let host = req.get_host();
         if self.0 == Protoc::HTTP {
-            host = http_port(host);
-            Some(Remote::new(Protoc::TLS, host))
+            let target = if host.contains(':') {
+                host.to_string()
+            } else {
+                format!("{}:443", host)
+            };
+            Some(Remote::new(self.0, target, host))
         } else if self.0 == Protoc::HTTPPT {
-            host = http_pt_port(host);
-            Some(Remote::new(Protoc::TCP, host))
+            let target = if host.contains(':') {
+                host.to_string()
+            } else {
+                format!("{}:80", host)
+            };
+            Some(Remote::new(self.0, target, host))
         } else {
+            warn!("no remote");
             None
         }
     }
 }
 
-fn http_pt_port(mut str: String) -> String {
-    if let None = str.find(':') {
-        str.push_str(":80");
-    }
-    str
-}
-
-fn http_port(mut str: String) -> String {
-    if let None = str.find(':') {
-        str.push_str(":443");
-    }
-    str
-}
-
 #[derive(Debug)]
-pub(crate) struct Visit {
-    pub(crate) server_protoc: Protoc,
-    pub(crate) server_addr: String,
-    pub(crate) remote_protoc: Protoc,
+pub(crate) struct VisitInfo {
+    server_protoc: Protoc,
+    server_addr: String,
+    remote_protoc: Protoc,
 }
 
-#[derive(Clone, Debug)]
+impl VisitInfo {
+    pub(crate) fn new(server_protoc: Protoc, server_addr: String, remote_protoc: Protoc) -> Self {
+        Self {
+            server_protoc,
+            server_addr,
+            remote_protoc,
+        }
+    }
+}
+
+#[derive(Clone, Debug, CopyGetters)]
 pub(crate) struct VisitR {
+    #[getset(get_copy = "pub(crate)")]
     sum: usize,
 }
 
@@ -70,59 +80,170 @@ impl VisitR {
     fn new() -> Self {
         Self { sum: 0 }
     }
+}
 
-    fn sum(&self) -> usize {
-        self.sum
+#[inline]
+async fn visit<T>(
+    server: &mut BufStream<T>,
+    v: &mut VisitFinder,
+    server_data_func: &mut impl FuncR,
+    remote_data_func: &mut impl FuncR,
+) where
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    server.read().await;
+    if server.is_empty() {
+        return;
+    }
+
+    let remote = if let Some(r) = v.get(server.r_buf_mut()).await {
+        r
+    } else {
+        return;
+    };
+
+    let remote_protoc = remote.protoc();
+    debug!("remote[{:?}]", remote.target());
+
+    let mut client = Client::new(remote);
+
+    if remote_protoc == Protoc::TCP || remote_protoc == Protoc::HTTPPT {
+        trace!("to_tcp");
+
+        if let Ok(mut remote) = client.tcp_stream().await {
+            read_loop(server, &mut remote, server_data_func, remote_data_func).await;
+        }
+    } else {
+        trace!("to_tls");
+
+        if let Ok(mut remote) = client.tls_stream().await {
+            read_loop(server, &mut remote, server_data_func, remote_data_func).await;
+        }
     }
 }
 
-pub(crate) fn start_up(vt: Visit) {
-    debug!("{:?}", vt);
-    new_thread_tokiort_block_on(async move {
-        match vt.server_protoc {
-            Protoc::HTTP => http(vt).await,
-            Protoc::HTTPPT => http_pt(vt).await,
-            _ => {}
-        }
-    });
+#[derive(Clone)]
+pub(self) struct VisitTls<T>
+where
+    T: FuncR,
+{
+    visit: VisitFinder,
+    server_data_func: T,
+    remote_data_func: T,
+    tls_acceptor: Arc<TlsAcceptor>,
 }
 
-async fn http(vt: Visit) {
-    debug!("Server tls start up");
-    let i = match valid_identity().await {
-        Some(i) => i,
-        None => {
-            error!("Server fail");
+#[async_trait]
+impl<T> FuncStream for VisitTls<T>
+where
+    T: FuncR,
+{
+    async fn consume(mut self, server: TcpStream) {
+        trace!("visit tls start");
+
+        let mut server = if let Ok(s) = tls_accept(&self.tls_acceptor, server).await {
+            BufStream::new(s)
+        } else {
             return;
-        }
-    };
+        };
 
-    let mut server = match Server::new(&vt.server_addr).await {
-        Ok(server) => server,
-        Err(e) => {
-            error!("Server error:{:?}", e);
-            return;
-        }
-    };
-
-    let sc = state::hold(server.addr.to_string()).await;
-
-    let pd = Procedure::new(VisitFinder(vt.remote_protoc), VisitR::new(), VisitR::new());
-    server.tls(pd, i, sc).await;
+        visit(
+            &mut server,
+            &mut self.visit,
+            &mut self.server_data_func,
+            &mut self.remote_data_func,
+        )
+        .await;
+    }
 }
 
-async fn http_pt(vt: Visit) {
-    debug!("Server tcp start up");
-    let mut server = match Server::new(&vt.server_addr).await {
-        Ok(server) => server,
-        Err(e) => {
-            error!("Server error:{:?}", e);
-            return;
+impl<T> VisitTls<T>
+where
+    T: FuncR,
+{
+    pub(crate) fn new(
+        visit: VisitFinder,
+        server_data_func: T,
+        remote_data_func: T,
+        t: TlsAcceptor,
+    ) -> Self {
+        Self {
+            visit,
+            server_data_func,
+            remote_data_func,
+            tls_acceptor: Arc::new(t),
         }
-    };
+    }
+}
 
-    let sc = state::hold(server.addr.to_string()).await;
+#[derive(Clone)]
+pub(self) struct Visit<T>
+where
+    T: FuncR,
+{
+    visit: VisitFinder,
+    server_data_func: T,
+    remote_data_func: T,
+}
 
-    let pd = Procedure::new(VisitFinder(vt.remote_protoc), VisitR::new(), VisitR::new());
-    server.tcp(pd, sc).await;
+#[async_trait]
+impl<T> FuncStream for Visit<T>
+where
+    T: FuncR,
+{
+    async fn consume(mut self, server: TcpStream) {
+        trace!("visit start");
+
+        let mut server = BufStream::new(server);
+
+        visit(
+            &mut server,
+            &mut self.visit,
+            &mut self.server_data_func,
+            &mut self.remote_data_func,
+        )
+        .await;
+    }
+}
+
+impl<T> Visit<T>
+where
+    T: FuncR,
+{
+    pub(crate) fn new(visit: VisitFinder, server_data_func: T, remote_data_func: T) -> Self {
+        Self {
+            visit,
+            server_data_func,
+            remote_data_func,
+        }
+    }
+}
+
+pub(crate) fn start_up(v: VisitInfo) {
+    debug!("start_up {:?}", v);
+    new_thread_tokiort_block_on(async move { server(v).await });
+}
+
+#[inline]
+async fn server(v: VisitInfo) {
+    match v.server_protoc {
+        Protoc::HTTP => {
+            debug!("server tls start up");
+            if let Ok(t) = get_tls_acceptor().await {
+                let o = VisitTls::new(
+                    VisitFinder(v.remote_protoc),
+                    VisitR::new(),
+                    VisitR::new(),
+                    t,
+                );
+                server_accept(&v.server_addr, o).await;
+            }
+        }
+        Protoc::HTTPPT => {
+            debug!("server tcp start up");
+            let o = Visit::new(VisitFinder(v.remote_protoc), VisitR::new(), VisitR::new());
+            server_accept(&v.server_addr, o).await;
+        }
+        _ => {}
+    }
 }
