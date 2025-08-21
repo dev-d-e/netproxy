@@ -1,18 +1,21 @@
+use super::*;
 use async_trait::async_trait;
+use getset::{CopyGetters, Getters, Setters};
 use log::{debug, error, info, trace};
-use std::fmt::Debug;
-use std::io::{Error, ErrorKind::InvalidData, ErrorKind::NotConnected, Result};
-use std::marker::Send;
+use std::collections::HashSet;
+use std::io::ErrorKind::{InvalidData, NotConnected, NotFound};
+use std::io::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::oneshot::Receiver;
-use tokio::sync::OnceCell;
-use tokio::time::{self, Duration};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot, OnceCell};
+use tokio::time::{interval, Duration};
 use tokio_native_tls::native_tls::{
     Identity, Protocol, TlsAcceptor as NativeAcceptor, TlsConnector as NativeConnector,
 };
 use tokio_native_tls::{TlsAcceptor, TlsConnector, TlsStream};
+
+const CHANNEL_CAPACITY: usize = 1000;
 
 const CAPACITY: usize = 8192;
 
@@ -25,72 +28,131 @@ async fn tls_connector() -> &'static TlsConnector {
 }
 
 fn get_connector() -> TlsConnector {
-    let c = match NativeConnector::new() {
-        Ok(c) => c,
-        Err(e) => panic!("{}", e),
-    };
-    TlsConnector::from(c)
+    TlsConnector::from(NativeConnector::new().expect("TlsConnector error"))
 }
 
 ///the minimum supported TLS protocol version is 1.2
 fn get_tls(identity: Identity) -> Result<TlsAcceptor> {
     let mut builder = NativeAcceptor::builder(identity);
     builder.min_protocol_version(Some(Protocol::Tlsv12));
-    let nta = builder.build().map_err(|e| Error::new(InvalidData, e))?;
-    let acceptor = TlsAcceptor::from(nta);
-    Ok(acceptor)
+    builder
+        .build()
+        .map_err(|e| Error::new(InvalidData, e))
+        .map(|n| TlsAcceptor::from(n))
 }
 
-#[async_trait]
-pub(crate) trait FuncControl {
-    fn stop_receiver(&mut self) -> Receiver<u8>;
+pub(crate) async fn get_tls_acceptor() -> Result<TlsAcceptor> {
+    let i = valid_identity()
+        .await
+        .ok_or(Error::new(NotFound, "no valid identity"))
+        .inspect_err(|_| error!("no valid identity"))?;
+    get_tls(i).inspect_err(|e| error!("can not get TlsAcceptor: {:?}", e))
+}
 
-    async fn reject_ip(&self, ip: IpAddr) -> bool;
+pub(crate) async fn tls_accept(t: &Arc<TlsAcceptor>, s: TcpStream) -> Result<TlsStream<TcpStream>> {
+    t.accept(s)
+        .await
+        .inspect_err(|e| error!("tls accept: {:?}", e))
+        .map_err(|e| Error::new(NotConnected, e))
+}
 
-    async fn velocity(&self, velocity: u32);
+pub(crate) enum ControlInfo {
+    Close,
+    IpScope(Vec<IpAddr>),
+    Ip(IpAddr),
+}
+
+pub(crate) enum StateInfo {
+    Sum(u32, String),
 }
 
 #[async_trait]
 pub(crate) trait FuncStream: Clone + Send + Sync + 'static {
-    async fn tcp(self, socket: TcpStream);
-
-    async fn tls(self, socket: TlsStream<TcpStream>);
+    async fn consume(self, socket: TcpStream);
 }
 
-#[derive(Debug)]
+#[derive(Getters)]
 pub(crate) struct Server {
     listener: TcpListener,
-    pub(crate) addr: SocketAddr,
+    #[getset(get = "pub(crate)")]
+    addr: SocketAddr,
+    control_receiver: oneshot::Receiver<ControlInfo>,
+    state_sender: mpsc::Sender<StateInfo>,
+    ip_scope: HashSet<IpAddr>,
 }
 
 impl Server {
-    pub(crate) async fn new(str: &String) -> Result<Server> {
-        info!("Server bind[{}]", str);
-        let listener = TcpListener::bind(str).await?;
-        let addr = listener.local_addr()?;
-        Ok(Server { listener, addr })
+    pub(crate) async fn new(
+        s: &str,
+    ) -> Result<(
+        Self,
+        oneshot::Sender<ControlInfo>,
+        mpsc::Receiver<StateInfo>,
+    )> {
+        let (control_sender, control_receiver) = oneshot::channel();
+        let (state_sender, state_receiver) = mpsc::channel(CHANNEL_CAPACITY);
+
+        Self::with_channel(s, control_receiver, state_sender)
+            .await
+            .map(|o| (o, control_sender, state_receiver))
     }
 
-    pub(crate) async fn tcp(&mut self, func: impl FuncStream, mut c: impl FuncControl) {
-        let mut rx = c.stop_receiver();
+    pub(crate) async fn with_channel(
+        s: &str,
+        control_receiver: oneshot::Receiver<ControlInfo>,
+        state_sender: mpsc::Sender<StateInfo>,
+    ) -> Result<Self> {
+        info!("server bind[{}]", s);
+        let listener = TcpListener::bind(s).await?;
+        listener.local_addr().map(|addr| Self {
+            listener,
+            addr,
+            control_receiver,
+            state_sender,
+            ip_scope: HashSet::new(),
+        })
+    }
+
+    pub(crate) fn set_ip_scope(&mut self, ipscope: &Vec<IpAddr>) {
+        self.ip_scope.clear();
+        for i in ipscope {
+            self.ip_scope.insert(*i);
+        }
+    }
+
+    fn add_ip_scope(&mut self, i: IpAddr) {
+        self.ip_scope.insert(i);
+    }
+
+    fn reject_ip(&self, ip: IpAddr) -> bool {
+        if self.ip_scope.is_empty() {
+            return false;
+        }
+        if self.ip_scope.contains(&ip) {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) async fn accept(&mut self, func: impl FuncStream) {
         let mut n: u32 = 0;
-        let mut interval = time::interval(Duration::from_secs(1));
+        let mut interval = interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 socket = self.listener.accept() => {
                     let socket = match socket {
                         Ok((socket, _)) => socket,
                         Err(e) => {
-                            error!("Server(tcp) accept error:{:?}", e);
+                            error!("server accept:{:?}", e);
                             continue;
                         }
                     };
-                    trace!("Server(tcp) accept");
+                    trace!("server accept");
 
                     if let Ok(peer_addr) = socket.peer_addr() {
                         let ip = peer_addr.ip();
-                        if c.reject_ip(ip).await {
-                            info!("Server(tcp) reject ip {:?}", ip);
+                        if self.reject_ip(ip) {
+                            info!("server reject ip {:?}", ip);
                             drop(socket);
                             continue;
                         }
@@ -98,161 +160,104 @@ impl Server {
 
                     let func = func.clone();
                     tokio::spawn(async move {
-                        func.tcp(socket).await;
+                        func.consume(socket).await;
                     });
                     n += 1;
                 },
-                Ok(_) =  &mut rx => {
-                    info!("Server(tcp) {:?} stop", self.addr.to_string());
-                    return;
+                Ok(c) = &mut self.control_receiver => {
+                    match c{
+                        ControlInfo::Close => {
+                            info!("server {:?} stop", self.addr);
+                            return;
+                        },
+                        ControlInfo::IpScope(o) => {
+                            self.set_ip_scope(&o)
+                        },
+                        ControlInfo::Ip(i) => {
+                            self.add_ip_scope(i);
+                        },
+                    }
                 }
                 _ = interval.tick() => {
                     if n > 0 {
-                        c.velocity(n).await;
-                        n = 0;
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) async fn tls(
-        &mut self,
-        func: impl FuncStream,
-        identity: Identity,
-        mut c: impl FuncControl,
-    ) {
-        let tls_acceptor = match get_tls(identity) {
-            Ok(tls_acceptor) => tls_acceptor,
-            Err(e) => {
-                error!("Server(tls) can not get \"TlsAcceptor\" error:{:?}", e);
-                return;
-            }
-        };
-        let mut rx = c.stop_receiver();
-        let mut n: u32 = 0;
-        let mut interval = time::interval(Duration::from_secs(1));
-        loop {
-            tokio::select! {
-                socket = self.listener.accept() => {
-                    let socket=match socket{
-                        Ok((socket, _)) => socket,
-                        Err(e) => {
-                            error!("Server(tls) accept error:{:?}", e);
-                            continue;
-                        }
-                    };
-                    trace!("Server(tls) accept");
-
-                    if let Ok(peer_addr) = socket.peer_addr() {
-                        let ip = peer_addr.ip();
-                        if c.reject_ip(ip).await {
-                            info!("Server(tls) reject ip {:?}", ip);
-                            drop(socket);
-                            continue;
+                        if let Ok(_) = self.state_sender.try_send(StateInfo::Sum(n,now_str())){
+                            n = 0;
                         }
                     }
-
-                    let tls_acceptor = tls_acceptor.clone();
-                    let func = func.clone();
-                    tokio::spawn(async move {
-                        let socket = match tls_acceptor.accept(socket).await {
-                            Ok(socket) => socket,
-                            Err(e) => {
-                                error!("Server(tls) acceptor error:{:?}", e);
-                                return;
-                            }
-                        };
-                        func.tls(socket).await;
-                    });
-                    n += 1;
-                }
-                Ok(_) = &mut rx => {
-                    info!("Server(tls) {:?} stop", self.addr.to_string());
-                    return;
-                }
-                _ = interval.tick() => {
-                    if n > 0 {
-                        c.velocity(n).await;
-                        n = 0;
-                    }
                 }
             }
         }
     }
 }
 
-#[async_trait]
-pub(crate) trait FuncData: Clone + Send + Sync + 'static {
-    async fn udp(self, socket: Arc<UdpSocket>, buf: Vec<u8>, addr: SocketAddr);
-}
-
-pub(crate) struct UdpServer {
-    socket: UdpSocket,
-    pub(crate) addr: SocketAddr,
-}
-
-impl UdpServer {
-    pub(crate) async fn new(str: &String) -> Result<UdpServer> {
-        info!("Server bind({})", str);
-        let socket = UdpSocket::bind(str).await?;
-        let addr = socket.local_addr()?;
-        Ok(UdpServer { socket, addr })
-    }
-
-    pub(crate) async fn udp<T>(self, func: T)
-    where
-        T: FuncData,
-    {
-        let socket = Arc::new(self.socket);
-        loop {
-            let mut buf = Vec::<u8>::with_capacity(CAPACITY);
-            match socket.recv_buf_from(&mut buf).await {
-                Ok((n, from)) => {
-                    trace!("Server(udp) recv {}", n);
-                    if n > 0 {
-                        let socket = socket.clone();
-                        let func = func.clone();
-                        tokio::spawn(async move {
-                            func.udp(socket, buf, from).await;
-                        });
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        trace!("Server(udp) recv WouldBlock");
-                    } else {
-                        error!("Server(udp) recv error:{:?}", e);
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub(crate) async fn connect(str: &String) -> Result<TcpStream> {
-    let ts = TcpStream::connect(str).await?;
-    debug!(
-        "connect[{:?}]-[{:?}]",
-        &ts.local_addr()
-            .map(|s| s.to_string())
-            .unwrap_or("".to_string()),
-        &ts.peer_addr()
-            .map(|s| s.to_string())
-            .unwrap_or("".to_string())
-    );
-    Ok(ts)
-}
-
-pub(crate) async fn connect_tls(str: &String) -> Result<TlsStream<TcpStream>> {
-    let socket = connect(&str).await?;
-    let mut s = str.clone();
-    if let Some(n) = str.find(':') {
-        s.truncate(n);
-    }
-
-    let c = tls_connector().await;
-    c.connect(s.as_str(), socket)
+async fn connect(str: &str) -> Result<TcpStream> {
+    TcpStream::connect(str)
         .await
+        .inspect(|ts| {
+            let a = ts
+                .local_addr()
+                .map(|s| s.to_string())
+                .unwrap_or(String::new());
+            let b = ts
+                .peer_addr()
+                .map(|s| s.to_string())
+                .unwrap_or(String::new());
+            debug!("connect[{:?}]-[{:?}]", a, b);
+        })
+        .inspect_err(|e| error!("connect: {:?}", e))
+}
+
+async fn connect_tls(s: &str, d: &str) -> Result<TlsStream<TcpStream>> {
+    let socket = connect(&s).await?;
+    tls_connector()
+        .await
+        .connect(d, socket)
+        .await
+        .inspect_err(|e| error!("connect_tls: {:?}", e))
         .map_err(|e| Error::new(NotConnected, e))
+}
+
+#[derive(CopyGetters, Setters)]
+pub(crate) struct Client {
+    remote: Remote,
+    #[getset(get_copy = "pub(crate)", set = "pub(crate)")]
+    send_count: u16,
+}
+
+impl Client {
+    pub(crate) fn new(remote: Remote) -> Self {
+        Self {
+            remote,
+            send_count: 0,
+        }
+    }
+
+    pub(crate) async fn tcp_stream(&mut self) -> Result<BufStream<TcpStream>> {
+        let t = self.remote.target();
+        let n = std::cmp::max(self.send_count, 1);
+        if n > 1 {
+            for _ in 1..n {
+                let o = connect(t).await.map(|stream| BufStream::new(stream));
+                if o.is_ok() {
+                    return o;
+                }
+            }
+        }
+        connect(t).await.map(|stream| BufStream::new(stream))
+    }
+
+    pub(crate) async fn tls_stream(&mut self) -> Result<BufStream<TlsStream<TcpStream>>> {
+        let t = self.remote.target();
+        let h = self.remote.host();
+        let n = std::cmp::max(self.send_count, 1);
+        if n > 1 {
+            for _ in 1..n {
+                let o = connect_tls(t, h).await.map(|stream| BufStream::new(stream));
+                if o.is_ok() {
+                    return o;
+                }
+            }
+        }
+        connect_tls(t, h).await.map(|stream| BufStream::new(stream))
+    }
 }
