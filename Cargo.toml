@@ -11,6 +11,7 @@ async-trait = "*"
 bytes = "*"
 clap = { version = "*", features = ["derive"] }
 env_logger = "*"
+getset = "*"
 httpenergy = { version = "*", git = "https://github.com/dev-d-e/httpenergy.git" }
 log = "*"
 regex = "*"
