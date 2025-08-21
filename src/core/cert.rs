@@ -1,5 +1,6 @@
-use super::get_file;
-use std::io::{Error, ErrorKind, Result};
+use super::*;
+use std::io::ErrorKind::InvalidData;
+use std::io::{Error, Result};
 use tokio::sync::{Mutex, OnceCell};
 use tokio_native_tls::native_tls::Identity;
 
@@ -19,14 +20,10 @@ async fn get_identity() -> Option<Identity> {
     identity_vec().await.lock().await.first().cloned()
 }
 
-async fn build_identity(data: &[u8], pwd: &str) -> Option<Error> {
-    match Identity::from_pkcs12(data, pwd) {
-        Ok(identity) => {
-            add_identity(identity).await;
-            None
-        }
-        Err(e) => Some(Error::new(ErrorKind::InvalidData, e)),
-    }
+async fn build_identity(data: &[u8], pwd: &str) -> Result<()> {
+    let i = Identity::from_pkcs12(data, pwd).map_err(|e| Error::new(InvalidData, e))?;
+    add_identity(i).await;
+    Ok(())
 }
 
 ///get certificate info from "VALID_IDENTITY".
@@ -39,10 +36,7 @@ pub(crate) async fn valid_identity() -> Option<Identity> {
 ///then build identity
 pub(crate) async fn build_certificate_from_file(path: String, pwd: String) -> Result<usize> {
     let f = get_file(&path)?;
-    if let Some(e) = build_identity(f.as_slice(), &pwd).await {
-        return Err(e);
-    }
-    Ok(f.len())
+    build_identity(f.as_slice(), &pwd).await.map(|_| f.len())
 }
 
 ///input socket and  password
