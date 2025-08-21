@@ -1,24 +1,25 @@
-#[macro_use]
-mod rw;
 mod cert;
 mod hr;
 mod pd;
 mod pdtrait;
 mod rt;
+mod rw;
 mod sv;
 
-pub(crate) use cert::{build_certificate_from_file, build_certificate_from_socket, valid_identity};
-pub(crate) use hr::HttpRequest;
+pub(crate) use cert::*;
+use getset::{CopyGetters, Getters};
+pub(crate) use hr::*;
 use log::trace;
-pub(crate) use pd::{Procedure, ProcedureService};
-pub(crate) use pdtrait::{FuncR, FuncRemote, FuncRw};
-pub(crate) use rt::{new_thread_tokiort_block_on, tokiort_block_on};
+pub(crate) use pd::*;
+pub(crate) use pdtrait::*;
+pub(crate) use rt::*;
+pub(crate) use rw::*;
 use std::fs;
 use std::path::PathBuf;
-pub(crate) use sv::{connect, connect_tls, FuncControl, FuncStream, Server};
+pub(crate) use sv::*;
 use time::{OffsetDateTime, UtcOffset};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Protoc {
     TCP,
     TLS,
@@ -27,14 +28,23 @@ pub(crate) enum Protoc {
     HTTPPT,
 }
 
+#[derive(CopyGetters, Getters)]
 pub(crate) struct Remote {
-    pub(crate) protoc: Protoc,
-    pub(crate) host: String,
+    #[getset(get_copy = "pub(crate)")]
+    protoc: Protoc,
+    #[getset(get = "pub(crate)")]
+    target: String,
+    #[getset(get = "pub(crate)")]
+    host: String,
 }
 
 impl Remote {
-    pub(crate) fn new(protoc: Protoc, host: String) -> Self {
-        Self { protoc, host }
+    pub(crate) fn new(protoc: Protoc, target: String, host: String) -> Self {
+        Self {
+            protoc,
+            target,
+            host,
+        }
     }
 }
 
@@ -98,11 +108,8 @@ pub(crate) fn now_str() -> String {
     if let Ok(i) = UtcOffset::current_local_offset() {
         now.to_offset(i);
     }
-    let mut date_time = now.to_string();
-    if date_time.len() > 19 {
-        date_time.truncate(19);
-    }
-    date_time
+    let f = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    now.format(f).unwrap_or_else(|_| now.to_string())
 }
 
 pub(crate) fn divide(v: &mut Vec<usize>) {
