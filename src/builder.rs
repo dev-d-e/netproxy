@@ -1,13 +1,13 @@
 use crate::args::*;
 use crate::core::*;
-use crate::route::{self, Transfer};
-use crate::state;
-use crate::visit::{self, Visit};
+use crate::route::{self, *};
+use crate::state::{self, *};
+use crate::visit::{self, *};
 use async_trait::async_trait;
 use log::{debug, error, trace};
 use std::fmt::Debug;
-use std::net::SocketAddr;
-use tokio::sync::oneshot::Sender;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 
 const HTTP: &str = "http";
@@ -32,28 +32,10 @@ const OUTCOMES: [&str; 8] = [
 
 static mut SAFE: bool = false;
 
-static CURRENT_TX: OnceCell<Mutex<Vec<Sender<u8>>>> = OnceCell::const_new();
+static CURRENT: OnceCell<Mutex<Option<ServerState>>> = OnceCell::const_new();
 
-async fn current_tx() -> &'static Mutex<Vec<Sender<u8>>> {
-    CURRENT_TX
-        .get_or_init(|| async { Mutex::new(Vec::new()) })
-        .await
-}
-
-static CURRENT_ADDR: OnceCell<Mutex<String>> = OnceCell::const_new();
-
-async fn current_addr() -> &'static Mutex<String> {
-    CURRENT_ADDR
-        .get_or_init(|| async { Mutex::new(String::new()) })
-        .await
-}
-
-static IP_SCOPE: OnceCell<Mutex<Vec<String>>> = OnceCell::const_new();
-
-async fn ip_scope() -> &'static Mutex<Vec<String>> {
-    IP_SCOPE
-        .get_or_init(|| async { Mutex::new(Vec::new()) })
-        .await
+async fn current() -> &'static Mutex<Option<ServerState>> {
+    CURRENT.get_or_init(|| async { Mutex::new(None) }).await
 }
 
 fn to_protoc(s: &str) -> Option<Protoc> {
@@ -70,11 +52,11 @@ fn to_protoc(s: &str) -> Option<Protoc> {
 async fn send_stop() {
     unsafe {
         if SAFE {
-            trace!("CURRENT_TX send");
+            trace!("Close send");
             //send stop signal to current server
-            if let Some(tx) = current_tx().await.lock().await.pop() {
-                if let Err(e) = tx.send(0) {
-                    error!("CURRENT_TX send error:{:?}", e);
+            if let Some(c) = current().await.lock().await.take() {
+                if let Err(_) = c.send(ControlInfo::Close) {
+                    error!("Close send error");
                 }
             }
 
@@ -95,7 +77,7 @@ macro_rules! check_safe {
 
 async fn handle_cfg(str: String) -> String {
     match RuleType::from(str) {
-        RuleType::Transfer(o) => {
+        RuleType::Route(o) => {
             check_safe!();
             route::start_up(o);
             return OUTCOMES[6].to_string();
@@ -123,7 +105,7 @@ async fn handle_cfg(str: String) -> String {
         }
         RuleType::State(o) => {
             check_safe!();
-            if let Some(o) = o {
+            if let Some(o) = o.and_then(|o| o.parse::<SocketAddr>().ok()) {
                 return state::state_string(&o).await;
             } else {
                 return state::list().await;
@@ -131,10 +113,12 @@ async fn handle_cfg(str: String) -> String {
         }
         RuleType::Shutdown(o) => {
             check_safe!();
-            if !state::shutdown(&o).await {
-                return OUTCOMES[7].to_string();
+            if let Ok(o) = o.parse::<SocketAddr>() {
+                if state::shutdown(&o).await {
+                    return OUTCOMES[0].to_string();
+                }
             }
-            return OUTCOMES[0].to_string();
+            return OUTCOMES[7].to_string();
         }
         RuleType::None(n) => {
             check_safe!();
@@ -144,8 +128,8 @@ async fn handle_cfg(str: String) -> String {
 }
 
 enum RuleType {
-    Transfer(Transfer),
-    Visit(Visit),
+    Route(RouteInfo),
+    Visit(VisitInfo),
     CertificateF(String, String),
     CertificateS(String, String),
     State(Option<String>),
@@ -201,25 +185,21 @@ impl RuleType {
                                 }
                                 if let Some(c) = iter.next() {
                                     trace!("transfer configuration");
-                                    let (ra, mut proportion) =
-                                        some_addr_proportion(c, iter.next()).unwrap();
+                                    if c.is_empty() {
+                                        return Self::None(3);
+                                    }
+                                    let (ra, mut proportion) = some_addr_proportion(c, iter.next());
                                     divide(&mut proportion);
-                                    let o = Transfer {
-                                        server_protoc: p1,
-                                        server_addr: b.to_string(),
-                                        remote_protoc: p2,
-                                        remote_addrs: ra,
+                                    return Self::Route(RouteInfo::new(
+                                        p1,
+                                        b.to_string(),
+                                        p2,
+                                        ra,
                                         proportion,
-                                    };
-                                    return Self::Transfer(o);
+                                    ));
                                 } else {
                                     trace!("visit configuration");
-                                    let o = Visit {
-                                        server_protoc: p1,
-                                        server_addr: b.to_string(),
-                                        remote_protoc: p2,
-                                    };
-                                    return Self::Visit(o);
+                                    return Self::Visit(VisitInfo::new(p1, b.to_string(), p2));
                                 }
                             }
                         }
@@ -233,27 +213,22 @@ impl RuleType {
 
 //target socket addr, one or several, where data transfer to, split by ','
 //proportion of data transfer to target, split by ':'. it's digit and correspondence with third. if it's not digit, replace with 0. if number is less than socket addrs, fill with 1. it can be omitted.
-fn some_addr_proportion(a: &str, p: Option<&str>) -> Result<(Vec<String>, Vec<usize>), u8> {
+fn some_addr_proportion(a: &str, p: Option<&str>) -> (Vec<String>, Vec<usize>) {
     let addr: Vec<String> = a.split(',').map(|s| s.to_string()).collect();
-    if addr
-        .iter()
-        .find(|s| s.parse::<SocketAddr>().is_err())
-        .is_some()
-    {
-        return Err(3);
-    }
+    let addr_len = addr.len();
+
     let proportion: Vec<usize> = if let Some(p) = p {
         let mut p: Vec<usize> = p.split(':').map(|s| s.parse().unwrap_or(0)).collect();
-        if p.len() < addr.len() {
-            p.extend_from_slice(&[addr.len() - p.len(); 1]);
-        } else if p.len() > addr.len() {
-            p.truncate(addr.len());
+        if p.len() < addr_len {
+            p.extend_from_slice(&[addr_len - p.len(); 1]);
+        } else if p.len() > addr_len {
+            p.truncate(addr_len);
         }
         p
     } else {
-        [addr.len(); 1].to_vec()
+        [addr_len; 1].to_vec()
     };
-    Ok((addr, proportion))
+    (addr, proportion)
 }
 
 //if specify use tls connection, the first configuration sentence must be certificate sentence, then server will restart.
@@ -264,89 +239,89 @@ pub(crate) fn build(args: Args) {
         }
     }
 
-    let str = args.socket();
+    let addr = args.socket();
     let is_tool = args.is_tool();
     let ipscope = args.ipscope();
 
-    tokiort_block_on(async {
-        let mut server = match Server::new(str).await {
-            Ok(server) => server,
-            Err(e) => {
-                error!("Server error:{:?}", e);
-                return;
-            }
-        };
+    tokiort_block_on(async { start_up(addr, is_tool, &ipscope, false).await });
 
-        if is_tool {
-            spawn_tool(server.addr.to_string(), false);
-        }
-
-        current_addr()
-            .await
-            .lock()
-            .await
-            .push_str(&server.addr.to_string());
-        ip_scope().await.lock().await.extend_from_slice(&ipscope);
-
-        let pd = ProcedureService::new(Service::new(server.addr));
-
-        let (tx, mut sc) = state::no_hold().await;
-        current_tx().await.lock().await.push(tx);
-        sc.get_scope().extend_from_slice(&ipscope);
-
-        server.tcp(pd, sc).await;
-
-        close_tool();
-    });
-
-    debug!("current server restart");
-    tokiort_block_on(async {
-        let mut server = match Server::new(str).await {
-            Ok(server) => server,
-            Err(e) => {
-                error!("Server error:{:?}", e);
-                return;
-            }
-        };
-
-        if is_tool {
-            spawn_tool(server.addr.to_string(), true);
-        }
-
-        let pd = ProcedureService::new(Service::new(server.addr));
-
-        let (tx, mut sc) = state::no_hold().await;
-        current_tx().await.lock().await.push(tx);
-        sc.get_scope().extend_from_slice(&ipscope);
-
-        let t = match valid_identity().await {
-            Some(t) => t,
-            None => {
-                error!("server fail");
-                return;
-            }
-        };
-        server.tls(pd, t, sc).await;
-    });
-}
-
-#[derive(Clone, Debug)]
-struct Service {
-    host: SocketAddr,
-}
-
-#[async_trait]
-impl FuncRw for Service {
-    async fn service(&mut self, req: &mut Vec<u8>, rsp: &mut Vec<u8>) {
-        let str = into_str(req);
-        req.clear();
-        trace!("[{:?}]cfg:{:?}", &self.host, str);
-        rsp.extend_from_slice(handle_cfg(str).await.as_bytes());
+    if args.is_safe() {
+        debug!("current server restart");
+        tokiort_block_on(async { start_up(addr, is_tool, &ipscope, true).await });
     }
 }
 
-impl Service {
+async fn start_up(addr: &str, is_tool: bool, ipscope: &Vec<IpAddr>, is_safe: bool) {
+    let (mut server, a, mut b) = if let Ok(server) = Server::new(addr)
+        .await
+        .inspect_err(|e| error!("new server: {:?}", e))
+    {
+        server
+    } else {
+        return;
+    };
+    server.set_ip_scope(ipscope);
+
+    if is_tool {
+        spawn_tool(server.addr(), false);
+    }
+
+    current()
+        .await
+        .lock()
+        .await
+        .replace(ServerState::new(*server.addr(), a));
+
+    tokio::spawn(async move {
+        while let Some(o) = b.recv().await {
+            match o {
+                StateInfo::Sum(velocity, date_time) => {
+                    if let Some(ss) = current().await.lock().await.as_mut() {
+                        ss.set_velocity(velocity);
+                        *ss.date_time_mut() = date_time;
+                    }
+                }
+            }
+        }
+        trace!("current state end");
+    });
+
+    if is_safe {
+        if let Ok(t) = get_tls_acceptor().await {
+            let o = ServiceTls::new(MainService::new(*server.addr()), t);
+            server.accept(o).await;
+        } else {
+            error!("error end");
+        }
+    } else {
+        let o = Service::new(MainService::new(*server.addr()));
+        server.accept(o).await;
+    }
+
+    if is_tool {
+        close_tool();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MainService {
+    host: Arc<SocketAddr>,
+}
+
+#[async_trait]
+impl FuncRw for MainService {
+    async fn service(&mut self, req: &mut Vec<u8>, rsp: &mut Vec<u8>) {
+        let s = into_str(req);
+        req.clear();
+        trace!("[{:?}]cfg:{:?}", &self.host, s);
+        rsp.extend_from_slice(handle_cfg(s).await.as_bytes());
+    }
+}
+
+impl MainService {
     fn new(host: SocketAddr) -> Self {
-        Self { host }
+        Self {
+            host: Arc::new(host),
+        }
     }
 }
