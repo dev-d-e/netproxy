@@ -1,49 +1,62 @@
 mod http;
 
 use crate::core::*;
-use crate::state;
+use crate::state::*;
 use async_trait::async_trait;
-use log::{debug, error, trace};
+use getset::CopyGetters;
+use log::{debug, trace};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio_native_tls::TlsAcceptor;
 
 pub(crate) trait FuncRouteAlg: Send + Sync + 'static {
-    fn addr(&mut self, buf: &mut Vec<u8>) -> Option<String>;
+    fn addr(&mut self) -> (String, String);
 }
 
+#[derive(Clone)]
 struct RouteFinder(Arc<Mutex<dyn FuncRouteAlg>>, Protoc);
-
-impl Clone for RouteFinder {
-    fn clone(&self) -> Self {
-        RouteFinder(Arc::clone(&self.0), self.1.clone())
-    }
-}
-
-#[async_trait]
-impl FuncRemote for RouteFinder {
-    async fn get(&mut self, buf: &mut Vec<u8>) -> Option<Remote> {
-        let mut lock = self.0.lock().await;
-        let addr = lock.addr(buf);
-        drop(lock);
-        let s = addr?;
-        trace!("RouteFinder get:({:?})", s);
-        Some(Remote::new(self.1.clone(), s))
-    }
-}
 
 impl RouteFinder {
     fn new(a: impl FuncRouteAlg, p: Protoc) -> Self {
-        RouteFinder(Arc::new(Mutex::new(a)), p)
+        Self(Arc::new(Mutex::new(a)), p)
+    }
+
+    async fn get(&mut self) -> Remote {
+        let mut lock = self.0.lock().await;
+        let (addr, h) = lock.addr();
+        drop(lock);
+        trace!("RouteFinder get:({:?})", addr);
+        Remote::new(self.1.clone(), addr, h)
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct Transfer {
-    pub(crate) server_protoc: Protoc,
-    pub(crate) server_addr: String,
-    pub(crate) remote_protoc: Protoc,
-    pub(crate) remote_addrs: Vec<String>,
-    pub(crate) proportion: Vec<usize>,
+pub(crate) struct RouteInfo {
+    server_protoc: Protoc,
+    server_addr: String,
+    remote_protoc: Protoc,
+    remote_addrs: Vec<String>,
+    proportion: Vec<usize>,
+}
+
+impl RouteInfo {
+    pub(crate) fn new(
+        server_protoc: Protoc,
+        server_addr: String,
+        remote_protoc: Protoc,
+        remote_addrs: Vec<String>,
+        proportion: Vec<usize>,
+    ) -> Self {
+        Self {
+            server_protoc,
+            server_addr,
+            remote_protoc,
+            remote_addrs,
+            proportion,
+        }
+    }
 }
 
 fn get_index(mut v: Vec<usize>) -> Vec<usize> {
@@ -72,15 +85,17 @@ fn get_index(mut v: Vec<usize>) -> Vec<usize> {
 struct RouteAlg(Vec<String>, usize, Vec<usize>);
 
 impl FuncRouteAlg for RouteAlg {
-    fn addr(&mut self, _buf: &mut Vec<u8>) -> Option<String> {
+    fn addr(&mut self) -> (String, String) {
         let s = self.0[self.2[self.1]].clone();
         self.1 = (self.1 + 1) % self.2.len();
-        Some(s)
+        let h = s.split(':').next().unwrap_or_default().to_string();
+        (s, h)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, CopyGetters)]
 pub(crate) struct RouteR {
+    #[getset(get_copy = "pub(crate)")]
     sum: usize,
 }
 
@@ -99,71 +114,173 @@ impl RouteR {
     fn new() -> Self {
         Self { sum: 0 }
     }
+}
 
-    fn sum(&self) -> usize {
-        self.sum
+#[inline]
+async fn route<T>(
+    server: &mut BufStream<T>,
+    route: &mut RouteFinder,
+    server_data_func: &mut impl FuncR,
+    remote_data_func: &mut impl FuncR,
+) where
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    server.read().await;
+    if server.is_empty() {
+        return;
+    }
+
+    let remote = route.get().await;
+    let remote_protoc = remote.protoc();
+    debug!("remote[{:?}]", remote.target());
+
+    let mut client = Client::new(remote);
+
+    if remote_protoc == Protoc::TCP || remote_protoc == Protoc::HTTPPT {
+        trace!("to_tcp");
+
+        if let Ok(mut remote) = client.tcp_stream().await {
+            read_loop(server, &mut remote, server_data_func, remote_data_func).await;
+        }
+    } else {
+        trace!("to_tls");
+
+        if let Ok(mut remote) = client.tls_stream().await {
+            read_loop(server, &mut remote, server_data_func, remote_data_func).await;
+        }
     }
 }
 
-pub(crate) fn start_up(tf: Transfer) {
-    debug!("{:?}", tf);
-    new_thread_tokiort_block_on(async move {
-        match tf.server_protoc {
-            Protoc::HTTP => http::http(tf).await,
-            Protoc::HTTPPT => http::http_pt(tf).await,
-            Protoc::TCP => tcp(tf).await,
-            Protoc::TLS => tls(tf).await,
-            Protoc::UDP => udp(tf).await,
-        }
-    });
+#[derive(Clone)]
+pub(self) struct RouteTls<T>
+where
+    T: FuncR,
+{
+    route: RouteFinder,
+    server_data_func: T,
+    remote_data_func: T,
+    tls_acceptor: Arc<TlsAcceptor>,
 }
 
-async fn tcp(tf: Transfer) {
-    debug!("Server tcp start up");
-    let mut server = match Server::new(&tf.server_addr).await {
-        Ok(server) => server,
-        Err(e) => {
-            error!("Server error:{:?}", e);
+#[async_trait]
+impl<T> FuncStream for RouteTls<T>
+where
+    T: FuncR,
+{
+    async fn consume(mut self, server: TcpStream) {
+        trace!("route tls start");
+
+        let mut server = if let Ok(s) = tls_accept(&self.tls_acceptor, server).await {
+            BufStream::new(s)
+        } else {
             return;
-        }
-    };
+        };
 
-    let sc = state::hold(server.addr.to_string()).await;
-
-    let protoc = tf.remote_protoc;
-    if protoc == Protoc::TCP || protoc == Protoc::TLS {
-        let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-        let pd = Procedure::new(RouteFinder::new(ra, protoc), RouteR::new(), RouteR::new());
-        server.tcp(pd, sc).await;
+        route(
+            &mut server,
+            &mut self.route,
+            &mut self.server_data_func,
+            &mut self.remote_data_func,
+        )
+        .await;
     }
 }
 
-async fn tls(tf: Transfer) {
-    debug!("Server tls start up");
-    let i = match valid_identity().await {
-        Some(i) => i,
-        None => {
-            error!("Server fail");
-            return;
+impl<T> RouteTls<T>
+where
+    T: FuncR,
+{
+    pub(crate) fn new(
+        route: RouteFinder,
+        server_data_func: T,
+        remote_data_func: T,
+        t: TlsAcceptor,
+    ) -> Self {
+        Self {
+            route,
+            server_data_func,
+            remote_data_func,
+            tls_acceptor: Arc::new(t),
         }
-    };
-
-    let mut server = match Server::new(&tf.server_addr).await {
-        Ok(server) => server,
-        Err(e) => {
-            error!("Server error:{:?}", e);
-            return;
-        }
-    };
-
-    let sc = state::hold(server.addr.to_string()).await;
-
-    let protoc = tf.remote_protoc;
-    if protoc == Protoc::TCP || protoc == Protoc::TLS {
-        let ra = RouteAlg(tf.remote_addrs, 0, get_index(tf.proportion));
-        let pd = Procedure::new(RouteFinder::new(ra, protoc), RouteR::new(), RouteR::new());
-        server.tls(pd, i, sc).await;
     }
 }
 
-async fn udp(_tf: Transfer) {}
+#[derive(Clone)]
+pub(self) struct Route<T>
+where
+    T: FuncR,
+{
+    route: RouteFinder,
+    server_data_func: T,
+    remote_data_func: T,
+}
+
+#[async_trait]
+impl<T> FuncStream for Route<T>
+where
+    T: FuncR,
+{
+    async fn consume(mut self, server: TcpStream) {
+        trace!("route start");
+
+        let mut server = BufStream::new(server);
+
+        route(
+            &mut server,
+            &mut self.route,
+            &mut self.server_data_func,
+            &mut self.remote_data_func,
+        )
+        .await;
+    }
+}
+
+impl<T> Route<T>
+where
+    T: FuncR,
+{
+    pub(crate) fn new(route: RouteFinder, server_data_func: T, remote_data_func: T) -> Self {
+        Self {
+            route,
+            server_data_func,
+            remote_data_func,
+        }
+    }
+}
+
+pub(crate) fn start_up(r: RouteInfo) {
+    debug!("start_up {:?}", r);
+    new_thread_tokiort_block_on(async move { server(r).await });
+}
+
+#[inline]
+async fn server(r: RouteInfo) {
+    match r.server_protoc {
+        Protoc::HTTP => http::http(r).await,
+        Protoc::HTTPPT => http::http_pt(r).await,
+        Protoc::TCP => {
+            debug!("server tcp start up");
+            let ra = RouteAlg(r.remote_addrs, 0, get_index(r.proportion));
+            let o = Route::new(
+                RouteFinder::new(ra, r.remote_protoc),
+                RouteR::new(),
+                RouteR::new(),
+            );
+            server_accept(&r.server_addr, o).await;
+        }
+        Protoc::TLS => {
+            debug!("server tls start up");
+            if let Ok(t) = get_tls_acceptor().await {
+                let ra = RouteAlg(r.remote_addrs, 0, get_index(r.proportion));
+                let o = RouteTls::new(
+                    RouteFinder::new(ra, r.remote_protoc),
+                    RouteR::new(),
+                    RouteR::new(),
+                    t,
+                );
+                server_accept(&r.server_addr, o).await;
+            }
+        }
+        Protoc::UDP => {}
+    }
+}
