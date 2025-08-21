@@ -1,320 +1,138 @@
-use super::{connect, connect_tls, FuncR, FuncRemote, FuncRw, FuncStream, Protoc};
+use super::*;
 use async_trait::async_trait;
-use log::{debug, error, trace, warn};
-use std::fmt::Debug;
+use log::{debug, trace};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
+use tokio_native_tls::TlsAcceptor;
 
-const CAPACITY: usize = 8192;
-
-#[derive(Debug)]
-pub(crate) struct Procedure<T, S>(T, S, S)
-where
-    T: FuncRemote,
-    S: FuncR;
-
-impl<T, S> Clone for Procedure<T, S>
-where
-    T: FuncRemote,
-    S: FuncR,
+pub(crate) async fn read_loop<T, S>(
+    server: &mut BufStream<T>,
+    remote: &mut BufStream<S>,
+    server_data_func: &mut impl FuncR,
+    remote_data_func: &mut impl FuncR,
+) where
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    fn clone(&self) -> Self {
-        Procedure::new(self.0.clone(), self.1.clone(), self.2.clone())
+    if server.has_remaining() {
+        let mut v = server.take_buf();
+        server_data_func.data(&mut v).await;
+        remote.write(v).await;
     }
+    loop {
+        tokio::select! {
+            _ = server.read() => {
+                if server.has_remaining(){
+                    let mut v = server.take_buf();
+                    if server.r_f(){
+                        server_data_func.enddata(&mut v).await;
+                    }else{
+                        server_data_func.data(&mut v).await;
+                    }
+                    remote.write(v).await;
+                }
+                if server.r_f() || remote.w_f() {
+                    debug!("server->remote end");
+                    return;
+                }
+            }
+            _ = remote.read() => {
+                if remote.has_remaining(){
+                    let mut v = remote.take_buf();
+                    if remote.r_f() {
+                        remote_data_func.enddata(&mut v).await;
+                    }else{
+                        remote_data_func.data(&mut v).await;
+                    }
+                    server.write(v).await;
+                }
+                if remote.r_f() || server.w_f() {
+                    debug!("remote->server end");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn service_loop<T, S>(mut server: BufStream<T>, mut func: S)
+where
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
+    S: FuncRw,
+{
+    loop {
+        server.read().await;
+        if server.has_remaining() {
+            let mut r_buf = server.take_buf();
+            func.service(&mut r_buf, server.w_buf_mut()).await;
+            server.write_buf().await;
+        }
+        if server.r_f() || server.w_f() {
+            debug!("end");
+            break;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ServiceTls<T>
+where
+    T: FuncRw,
+{
+    func: T,
+    tls_acceptor: Arc<TlsAcceptor>,
 }
 
 #[async_trait]
-impl<T, S> FuncStream for Procedure<T, S>
+impl<T> FuncStream for ServiceTls<T>
 where
-    T: FuncRemote,
-    S: FuncR,
+    T: FuncRw,
 {
-    async fn tcp(mut self, server: TcpStream) {
-        trace!("Procedure start");
-        let mut buf = Vec::<u8>::with_capacity(CAPACITY);
-        tcp_stream_start!(server, buf);
-        if buf.len() == 0 {
-            return;
-        }
-        let remote = match self.0.get(&mut buf).await {
-            Some(r) => r,
-            None => {
-                warn!("no remote");
-                return;
-            }
-        };
-        debug!("remote[{:?}]", remote.host);
-        if remote.protoc == Protoc::TCP {
-            tcp_to_tcp(server, buf, remote.host, self.1, self.2).await;
-        } else {
-            tcp_to_tls(server, buf, remote.host, self.1, self.2).await;
-        }
-    }
-
-    async fn tls(mut self, mut server: TlsStream<TcpStream>) {
-        trace!("Procedure start");
-        let mut buf = Vec::<u8>::with_capacity(CAPACITY);
-        async_ext_start!(server, buf);
-        if buf.len() == 0 {
-            return;
-        }
-        let remote = match self.0.get(&mut buf).await {
-            Some(r) => r,
-            None => {
-                warn!("no remote");
-                return;
-            }
-        };
-        debug!("remote[{:?}]", remote.host);
-        if remote.protoc == Protoc::TCP {
-            tls_to_tcp(server, buf, remote.host, self.1, self.2).await;
-        } else {
-            tls_to_tls(server, buf, remote.host, self.1, self.2).await;
+    async fn consume(self, server: TcpStream) {
+        trace!("service tls start");
+        if let Ok(server) = tls_accept(&self.tls_acceptor, server).await {
+            service_loop(BufStream::new(server), self.func).await;
         }
     }
 }
 
-impl<T, S> Procedure<T, S>
+impl<T> ServiceTls<T>
 where
-    T: FuncRemote,
-    S: FuncR,
+    T: FuncRw,
 {
-    pub(crate) fn new(remote: T, server_data_func: S, remote_data_func: S) -> Self {
-        Procedure(remote, server_data_func, remote_data_func)
+    pub(crate) fn new(func: T, t: TlsAcceptor) -> Self {
+        Self {
+            func,
+            tls_acceptor: Arc::new(t),
+        }
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ProcedureService<T: FuncRw>(T);
-
-impl<T: FuncRw> Clone for ProcedureService<T> {
-    fn clone(&self) -> Self {
-        ProcedureService::new(self.0.clone())
-    }
+#[derive(Clone)]
+pub(crate) struct Service<T>
+where
+    T: FuncRw,
+{
+    func: T,
 }
 
 #[async_trait]
-impl<T: FuncRw> FuncStream for ProcedureService<T> {
-    async fn tcp(self, server: TcpStream) {
-        trace!("Service start");
-        handle(server, self.0).await;
-        trace!("Service end");
-    }
-
-    async fn tls(self, server: TlsStream<TcpStream>) {
-        trace!("Service start");
-        handle(server, self.0).await;
-        trace!("Service end");
+impl<T> FuncStream for Service<T>
+where
+    T: FuncRw,
+{
+    async fn consume(mut self, server: TcpStream) {
+        trace!("service start");
+        service_loop(BufStream::new(server), self.func).await;
     }
 }
 
-impl<T: FuncRw> ProcedureService<T> {
+impl<T> Service<T>
+where
+    T: FuncRw,
+{
     pub(crate) fn new(func: T) -> Self {
-        ProcedureService(func)
-    }
-}
-
-//
-//====================================================================================================
-
-async fn tcp_to_tcp(
-    mut server: TcpStream,
-    mut buf: Vec<u8>,
-    remote: String,
-    mut server_data_func: impl FuncR,
-    mut remote_data_func: impl FuncR,
-) {
-    trace!("tcp_to_tcp");
-
-    let mut remote = match connect(&remote).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("remote error:{:?}", e);
-            return;
-        }
-    };
-
-    if let Err(e) = remote.write_all(&buf).await {
-        error!("remote write error:{:?}", e);
-        return;
-    }
-
-    let (rd, mut wr) = server.split();
-    let (rd2, mut wr2) = remote.split();
-
-    let mut buf2 = Vec::<u8>::with_capacity(CAPACITY);
-    loop {
-        tokio::select! {
-            Ok(_) = rd.readable() => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                tcp_stream_read!(rd, buf, server_data_func, wr2, state, "server->remote");
-                if state.0 || state.2 {
-                    debug!("server->remote: end");
-                    return;
-                }
-            }
-            Ok(_) = rd2.readable() => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                tcp_stream_read!(rd2, buf2, remote_data_func, wr, state, "remote->server");
-                if state.0 || state.2 {
-                    debug!("remote->server: end");
-                    return;
-                }
-            }
-        }
-    }
-}
-
-async fn tcp_to_tls(
-    mut server: TcpStream,
-    mut buf: Vec<u8>,
-    remote: String,
-    mut server_data_func: impl FuncR,
-    mut remote_data_func: impl FuncR,
-) {
-    trace!("tcp_to_tls");
-
-    let mut remote = match connect_tls(&remote).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("remote error:{:?}", e);
-            return;
-        }
-    };
-
-    if let Err(e) = remote.write_all(&buf).await {
-        error!("remote write error:{:?}", e);
-        return;
-    }
-
-    let (rd, mut wr) = server.split();
-
-    let mut buf2 = Vec::<u8>::with_capacity(CAPACITY);
-    loop {
-        tokio::select! {
-            Ok(_) = rd.readable() => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                tcp_stream_read!(rd, buf, server_data_func, remote, state, "server->remote");
-                if state.0 || state.2 {
-                    debug!("server->remote: end");
-                    return;
-                }
-            },
-            r = remote.read_buf(&mut buf2) => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                async_ext_read!(r, buf2, remote_data_func, wr, state, "remote->server");
-                if state.0 || state.2 {
-                    debug!("remote->server: end");
-                 return;
-                }
-            }
-        }
-    }
-}
-
-async fn tls_to_tcp(
-    mut server: TlsStream<TcpStream>,
-    mut buf: Vec<u8>,
-    remote: String,
-    mut server_data_func: impl FuncR,
-    mut remote_data_func: impl FuncR,
-) {
-    trace!("tls_to_tcp");
-
-    let mut remote = match connect(&remote).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("remote error:{:?}", e);
-            return;
-        }
-    };
-
-    if let Err(e) = remote.write_all(&buf).await {
-        error!("remote write error:{:?}", e);
-        return;
-    }
-
-    let (rd, mut wr) = remote.split();
-
-    let mut buf2 = Vec::<u8>::with_capacity(CAPACITY);
-    loop {
-        tokio::select! {
-            r = server.read_buf(&mut buf) => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                async_ext_read!(r, buf, server_data_func, wr, state, "server->remote");
-                if state.0 || state.2 {
-                    debug!("server->remote: end");
-                    return;
-                }
-            }
-            Ok(_) = rd.readable() => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                tcp_stream_read!(rd, buf2, remote_data_func, server, state, "remote->server");
-                if state.0 || state.2 {
-                    debug!("remote->server: end");
-                    return;
-                }
-            }
-        }
-    }
-}
-
-async fn tls_to_tls(
-    mut server: TlsStream<TcpStream>,
-    mut buf: Vec<u8>,
-    remote: String,
-    mut server_data_func: impl FuncR,
-    mut remote_data_func: impl FuncR,
-) {
-    trace!("tls_to_tls");
-
-    let mut remote = match connect_tls(&remote).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("remote error:{:?}", e);
-            return;
-        }
-    };
-
-    if let Err(e) = remote.write_all(&buf).await {
-        error!("remote write error:{:?}", e);
-        return;
-    }
-
-    let mut buf2 = Vec::<u8>::with_capacity(CAPACITY);
-    loop {
-        tokio::select! {
-            r = server.read_buf(&mut buf) => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                async_ext_read!(r, buf, server_data_func, remote, state, "server->remote");
-                if state.0 || state.2 {
-                    debug!("server->remote: end");
-                    return;
-                }
-            }
-            r = remote.read_buf(&mut buf2) => {
-                let mut state: (bool, bool, bool) = (false, false, false);
-                 async_ext_read!(r, buf2, remote_data_func, server, state, "remote->server");
-                if state.0 || state.2 {
-                    debug!("remote->server: end");
-                    return;
-                }
-            }
-        }
-    }
-}
-
-async fn handle<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut server: S, func: impl FuncRw) {
-    loop {
-        let mut func = func.clone();
-
-        let mut r_buf = Vec::<u8>::with_capacity(CAPACITY);
-        let mut w_buf = Vec::<u8>::with_capacity(CAPACITY);
-        let mut state: (bool, bool, bool) = (false, false, false);
-        async_ext_rw!(server, r_buf, w_buf, func, state);
-        if state.0 || state.2 {
-            return;
-        }
+        Self { func }
     }
 }
