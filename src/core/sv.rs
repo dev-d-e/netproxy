@@ -1,15 +1,11 @@
 use super::*;
 use async_trait::async_trait;
-use getset::{CopyGetters, Getters, Setters};
-use log::{debug, error, info, trace};
 use std::collections::HashSet;
-use std::io::ErrorKind::{InvalidData, NotConnected, NotFound};
-use std::io::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, OnceCell};
-use tokio::time::{interval, Duration};
+use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::time::{Duration, interval};
 use tokio_native_tls::native_tls::{
     Identity, Protocol, TlsAcceptor as NativeAcceptor, TlsConnector as NativeConnector,
 };
@@ -32,28 +28,30 @@ fn get_connector() -> TlsConnector {
 }
 
 ///the minimum supported TLS protocol version is 1.2
-fn get_tls(identity: Identity) -> Result<TlsAcceptor> {
+fn get_tls(identity: Identity) -> Option<TlsAcceptor> {
     let mut builder = NativeAcceptor::builder(identity);
     builder.min_protocol_version(Some(Protocol::Tlsv12));
     builder
         .build()
-        .map_err(|e| Error::new(InvalidData, e))
+        .map_err(|e| error!("can not get TlsAcceptor: {e}"))
         .map(|n| TlsAcceptor::from(n))
+        .ok()
 }
 
-pub(crate) async fn get_tls_acceptor() -> Result<TlsAcceptor> {
-    let i = valid_identity()
-        .await
-        .ok_or(Error::new(NotFound, "no valid identity"))
-        .inspect_err(|_| error!("no valid identity"))?;
-    get_tls(i).inspect_err(|e| error!("can not get TlsAcceptor: {:?}", e))
+pub(crate) async fn get_tls_acceptor() -> Option<TlsAcceptor> {
+    if let Some(i) = valid_identity().await {
+        get_tls(i)
+    } else {
+        error!("no valid identity");
+        None
+    }
 }
 
-pub(crate) async fn tls_accept(t: &Arc<TlsAcceptor>, s: TcpStream) -> Result<TlsStream<TcpStream>> {
+pub(crate) async fn tls_accept(t: &Arc<TlsAcceptor>, s: TcpStream) -> Option<TlsStream<TcpStream>> {
     t.accept(s)
         .await
-        .inspect_err(|e| error!("tls accept: {:?}", e))
-        .map_err(|e| Error::new(NotConnected, e))
+        .map_err(|e| error!("tls accept: {e}"))
+        .ok()
 }
 
 pub(crate) enum ControlInfo {
@@ -84,7 +82,7 @@ pub(crate) struct Server {
 impl Server {
     pub(crate) async fn new(
         s: &str,
-    ) -> Result<(
+    ) -> Option<(
         Self,
         oneshot::Sender<ControlInfo>,
         mpsc::Receiver<StateInfo>,
@@ -101,16 +99,23 @@ impl Server {
         s: &str,
         control_receiver: oneshot::Receiver<ControlInfo>,
         state_sender: mpsc::Sender<StateInfo>,
-    ) -> Result<Self> {
+    ) -> Option<Self> {
         info!("server bind[{}]", s);
-        let listener = TcpListener::bind(s).await?;
-        listener.local_addr().map(|addr| Self {
-            listener,
-            addr,
-            control_receiver,
-            state_sender,
-            ip_scope: HashSet::new(),
-        })
+        let listener = TcpListener::bind(s)
+            .await
+            .map_err(|e| error!("server: {e}"))
+            .ok()?;
+        listener
+            .local_addr()
+            .map(|addr| Self {
+                listener,
+                addr,
+                control_receiver,
+                state_sender,
+                ip_scope: HashSet::new(),
+            })
+            .map_err(|e| error!("server: {e}"))
+            .ok()
     }
 
     pub(crate) fn set_ip_scope(&mut self, ipscope: &Vec<IpAddr>) {
@@ -143,7 +148,7 @@ impl Server {
                     let socket = match socket {
                         Ok((socket, _)) => socket,
                         Err(e) => {
-                            error!("server accept:{:?}", e);
+                            error!("server accept: {e}");
                             continue;
                         }
                     };
@@ -152,7 +157,7 @@ impl Server {
                     if let Ok(peer_addr) = socket.peer_addr() {
                         let ip = peer_addr.ip();
                         if self.reject_ip(ip) {
-                            info!("server reject ip {:?}", ip);
+                            info!("server reject ip: {ip}");
                             drop(socket);
                             continue;
                         }
@@ -190,31 +195,26 @@ impl Server {
     }
 }
 
-async fn connect(str: &str) -> Result<TcpStream> {
+async fn connect(str: &str) -> Option<TcpStream> {
     TcpStream::connect(str)
         .await
         .inspect(|ts| {
-            let a = ts
-                .local_addr()
-                .map(|s| s.to_string())
-                .unwrap_or(String::new());
-            let b = ts
-                .peer_addr()
-                .map(|s| s.to_string())
-                .unwrap_or(String::new());
-            debug!("connect[{:?}]-[{:?}]", a, b);
+            let a = ts.local_addr().map(|s| s.to_string()).unwrap_or_default();
+            let b = ts.peer_addr().map(|s| s.to_string()).unwrap_or_default();
+            debug!("connect[{a}]-[{b}]");
         })
-        .inspect_err(|e| error!("connect: {:?}", e))
+        .map_err(|e| error!("connect: {e}"))
+        .ok()
 }
 
-async fn connect_tls(s: &str, d: &str) -> Result<TlsStream<TcpStream>> {
+async fn connect_tls(s: &str, d: &str) -> Option<TlsStream<TcpStream>> {
     let socket = connect(&s).await?;
     tls_connector()
         .await
         .connect(d, socket)
         .await
-        .inspect_err(|e| error!("connect_tls: {:?}", e))
-        .map_err(|e| Error::new(NotConnected, e))
+        .map_err(|e| error!("connect_tls: {e}"))
+        .ok()
 }
 
 #[derive(CopyGetters, Setters)]
@@ -232,13 +232,13 @@ impl Client {
         }
     }
 
-    pub(crate) async fn tcp_stream(&mut self) -> Result<BufStream<TcpStream>> {
+    pub(crate) async fn tcp_stream(&mut self) -> Option<BufStream<TcpStream>> {
         let t = self.remote.target();
         let n = std::cmp::max(self.send_count, 1);
         if n > 1 {
             for _ in 1..n {
                 let o = connect(t).await.map(|stream| BufStream::new(stream));
-                if o.is_ok() {
+                if o.is_some() {
                     return o;
                 }
             }
@@ -246,14 +246,14 @@ impl Client {
         connect(t).await.map(|stream| BufStream::new(stream))
     }
 
-    pub(crate) async fn tls_stream(&mut self) -> Result<BufStream<TlsStream<TcpStream>>> {
+    pub(crate) async fn tls_stream(&mut self) -> Option<BufStream<TlsStream<TcpStream>>> {
         let t = self.remote.target();
         let h = self.remote.host();
         let n = std::cmp::max(self.send_count, 1);
         if n > 1 {
             for _ in 1..n {
                 let o = connect_tls(t, h).await.map(|stream| BufStream::new(stream));
-                if o.is_ok() {
+                if o.is_some() {
                     return o;
                 }
             }
