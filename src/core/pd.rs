@@ -1,6 +1,5 @@
 use super::*;
 use async_trait::async_trait;
-use log::{debug, trace};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -91,7 +90,7 @@ where
 {
     async fn consume(self, server: TcpStream) {
         trace!("service tls start");
-        if let Ok(server) = tls_accept(&self.tls_acceptor, server).await {
+        if let Some(server) = tls_accept(&self.tls_acceptor, server).await {
             service_loop(BufStream::new(server), self.func).await;
         }
     }
