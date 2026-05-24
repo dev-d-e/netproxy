@@ -1,5 +1,4 @@
-use getset::{CopyGetters, MutGetters};
-use log::{debug, error, trace};
+use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CAPACITY: usize = 8192;
@@ -55,7 +54,7 @@ where
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     debug!("read WouldBlock");
                 } else {
-                    error!("read error: {:?}", e);
+                    error!("read: {e}");
                     self.r_f = true;
                 }
             }
@@ -64,7 +63,7 @@ where
 
     pub(crate) async fn write(&mut self, o: Vec<u8>) {
         if let Err(e) = self.stream.write_all(&o).await {
-            error!("write error: {:?}", e);
+            error!("write: {e}");
             self.w_f = true;
         }
     }
@@ -76,7 +75,7 @@ where
     pub(crate) async fn write_buf(&mut self) {
         if self.w_buf.len() > 0 {
             if let Err(e) = self.stream.write_all(self.w_buf.drain(..).as_slice()).await {
-                error!("write error: {:?}", e);
+                error!("write_buf: {e}");
                 self.w_f = true;
             }
         }
