@@ -1,5 +1,4 @@
 use super::*;
-use log::debug;
 
 struct RouteAlg(Vec<String>, usize, Vec<usize>);
 
@@ -15,7 +14,7 @@ impl FuncRouteAlg for RouteAlg {
 pub(super) async fn http(r: RouteInfo) {
     debug!("server http start up");
 
-    if let Ok(t) = get_tls_acceptor().await {
+    if let Some(t) = get_tls_acceptor().await {
         let ra = RouteAlg(r.remote_addrs, 0, get_index(r.proportion));
         let o = RouteTls::new(
             RouteFinder::new(ra, r.remote_protoc),
