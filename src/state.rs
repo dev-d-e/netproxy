@@ -1,15 +1,13 @@
 use crate::core::*;
-use getset::{CopyGetters, Getters, MutGetters, Setters};
-use log::error;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+use tokio::sync::{OnceCell, RwLock, mpsc, oneshot};
 
-static SERVER_STATE: OnceCell<Mutex<HashMap<SocketAddr, ServerState>>> = OnceCell::const_new();
+static SERVER_STATE: OnceCell<RwLock<HashMap<SocketAddr, ServerState>>> = OnceCell::const_new();
 
-async fn server_state() -> &'static Mutex<HashMap<SocketAddr, ServerState>> {
+async fn server_state() -> &'static RwLock<HashMap<SocketAddr, ServerState>> {
     SERVER_STATE
-        .get_or_init(|| async { Mutex::new(HashMap::new()) })
+        .get_or_init(|| async { RwLock::new(HashMap::new()) })
         .await
 }
 
@@ -43,13 +41,13 @@ impl ServerState {
 async fn add_state(ss: ServerState) {
     server_state()
         .await
-        .lock()
+        .write()
         .await
         .insert((&ss.server).clone(), ss);
 }
 
 async fn remove_state(server: &SocketAddr) -> Option<ServerState> {
-    server_state().await.lock().await.remove(server)
+    server_state().await.write().await.remove(server)
 }
 
 pub(crate) async fn hold(
@@ -63,7 +61,7 @@ pub(crate) async fn hold(
         while let Some(o) = s.recv().await {
             match o {
                 StateInfo::Sum(velocity, date_time) => {
-                    if let Some(ss) = server_state().await.lock().await.get_mut(&server) {
+                    if let Some(ss) = server_state().await.write().await.get_mut(&server) {
                         ss.set_velocity(velocity);
                         ss.date_time = date_time;
                     }
@@ -74,17 +72,14 @@ pub(crate) async fn hold(
 }
 
 pub(crate) async fn server_accept(addr: &str, func: impl FuncStream) {
-    if let Ok((mut server, a, b)) = Server::new(addr)
-        .await
-        .inspect_err(|e| error!("new server: {:?}", e))
-    {
+    if let Some((mut server, a, b)) = Server::new(addr).await {
         hold(*server.addr(), a, b).await;
         server.accept(func).await;
     }
 }
 
 pub(crate) async fn list() -> String {
-    let map = server_state().await.lock().await;
+    let map = server_state().await.read().await;
     let mut s = String::new();
     s.push_str("ok ");
     for (key, val) in map.iter() {
@@ -104,7 +99,7 @@ pub(crate) async fn list() -> String {
 }
 
 pub(crate) async fn state_string(server: &SocketAddr) -> String {
-    let map = server_state().await.lock().await;
+    let map = server_state().await.read().await;
     let mut s = String::new();
     s.push_str("ok ");
     if let Some(ss) = map.get(server) {
