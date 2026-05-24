@@ -7,9 +7,9 @@ mod rw;
 mod sv;
 
 pub(crate) use cert::*;
-use getset::{CopyGetters, Getters};
+pub(crate) use getset::{CopyGetters, Getters, MutGetters, Setters};
 pub(crate) use hr::*;
-use log::trace;
+pub(crate) use log::{debug, error, info, trace, warn};
 pub(crate) use pd::*;
 pub(crate) use pdtrait::*;
 pub(crate) use rt::*;
@@ -71,13 +71,17 @@ pub(crate) fn into_str(buf: &[u8]) -> String {
 ///get file by "path".
 ///if it's a file path, read it to "Vec".
 ///if it's a dir path, read the first file in the dir to "Vec".
-fn get_file(path: &str) -> std::io::Result<Vec<u8>> {
-    let metadata = fs::metadata(path)?;
+fn get_file(path: &str) -> Option<Vec<u8>> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| error!("get file: {e}"))
+        .ok()?;
     if metadata.is_file() {
-        trace!("get file:{:?}", path);
-        return fs::read(path);
+        trace!("get file: {path}");
+        return fs::read(path).map_err(|e| error!("get file: {e}")).ok();
     } else if metadata.is_dir() {
-        let entries = fs::read_dir(path)?;
+        let entries = fs::read_dir(path)
+            .map_err(|e| error!("get file: {e}"))
+            .ok()?;
         let mut v: Vec<PathBuf> = entries
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -94,12 +98,13 @@ fn get_file(path: &str) -> std::io::Result<Vec<u8>> {
             if v.len() > 1 {
                 v.sort();
             }
-            trace!("get file:{:?}", &v[0]);
-            return fs::read(&v[0]);
+            let s = &v[0];
+            trace!("get file: {s:?}");
+            return fs::read(s).map_err(|e| error!("get file: {e}")).ok();
         }
     }
-    trace!("no file in [{:?}]", path);
-    Ok(Vec::new())
+    trace!("no file in [{path}]");
+    None
 }
 
 ///get the system time.
@@ -140,11 +145,7 @@ pub(crate) fn divide(v: &mut Vec<usize>) {
 //calculate common divisor.
 fn co_divisor(a: usize, b: usize) -> usize {
     let c = a % b;
-    if c == 0 {
-        b
-    } else {
-        co_divisor(b, c)
-    }
+    if c == 0 { b } else { co_divisor(b, c) }
 }
 
 #[test]
