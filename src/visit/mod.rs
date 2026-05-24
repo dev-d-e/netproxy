@@ -1,8 +1,6 @@
 use crate::core::*;
 use crate::state::*;
 use async_trait::async_trait;
-use getset::CopyGetters;
-use log::{debug, error, trace, warn};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -110,13 +108,13 @@ async fn visit<T>(
     if remote_protoc == Protoc::TCP || remote_protoc == Protoc::HTTPPT {
         trace!("to_tcp");
 
-        if let Ok(mut remote) = client.tcp_stream().await {
+        if let Some(mut remote) = client.tcp_stream().await {
             read_loop(server, &mut remote, server_data_func, remote_data_func).await;
         }
     } else {
         trace!("to_tls");
 
-        if let Ok(mut remote) = client.tls_stream().await {
+        if let Some(mut remote) = client.tls_stream().await {
             read_loop(server, &mut remote, server_data_func, remote_data_func).await;
         }
     }
@@ -141,7 +139,7 @@ where
     async fn consume(mut self, server: TcpStream) {
         trace!("visit tls start");
 
-        let mut server = if let Ok(s) = tls_accept(&self.tls_acceptor, server).await {
+        let mut server = if let Some(s) = tls_accept(&self.tls_acceptor, server).await {
             BufStream::new(s)
         } else {
             return;
@@ -229,7 +227,7 @@ async fn server(v: VisitInfo) {
     match v.server_protoc {
         Protoc::HTTP => {
             debug!("server tls start up");
-            if let Ok(t) = get_tls_acceptor().await {
+            if let Some(t) = get_tls_acceptor().await {
                 let o = VisitTls::new(
                     VisitFinder(v.remote_protoc),
                     VisitR::new(),
