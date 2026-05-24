@@ -3,12 +3,10 @@ mod http;
 use crate::core::*;
 use crate::state::*;
 use async_trait::async_trait;
-use getset::CopyGetters;
-use log::{debug, trace};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio_native_tls::TlsAcceptor;
 
 pub(crate) trait FuncRouteAlg: Send + Sync + 'static {
@@ -16,15 +14,15 @@ pub(crate) trait FuncRouteAlg: Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-struct RouteFinder(Arc<Mutex<dyn FuncRouteAlg>>, Protoc);
+struct RouteFinder(Arc<RwLock<dyn FuncRouteAlg>>, Protoc);
 
 impl RouteFinder {
     fn new(a: impl FuncRouteAlg, p: Protoc) -> Self {
-        Self(Arc::new(Mutex::new(a)), p)
+        Self(Arc::new(RwLock::new(a)), p)
     }
 
     async fn get(&mut self) -> Remote {
-        let mut lock = self.0.lock().await;
+        let mut lock = self.0.write().await;
         let (addr, h) = lock.addr();
         drop(lock);
         trace!("RouteFinder get:({:?})", addr);
@@ -139,13 +137,13 @@ async fn route<T>(
     if remote_protoc == Protoc::TCP || remote_protoc == Protoc::HTTPPT {
         trace!("to_tcp");
 
-        if let Ok(mut remote) = client.tcp_stream().await {
+        if let Some(mut remote) = client.tcp_stream().await {
             read_loop(server, &mut remote, server_data_func, remote_data_func).await;
         }
     } else {
         trace!("to_tls");
 
-        if let Ok(mut remote) = client.tls_stream().await {
+        if let Some(mut remote) = client.tls_stream().await {
             read_loop(server, &mut remote, server_data_func, remote_data_func).await;
         }
     }
@@ -170,7 +168,7 @@ where
     async fn consume(mut self, server: TcpStream) {
         trace!("route tls start");
 
-        let mut server = if let Ok(s) = tls_accept(&self.tls_acceptor, server).await {
+        let mut server = if let Some(s) = tls_accept(&self.tls_acceptor, server).await {
             BufStream::new(s)
         } else {
             return;
@@ -270,7 +268,7 @@ async fn server(r: RouteInfo) {
         }
         Protoc::TLS => {
             debug!("server tls start up");
-            if let Ok(t) = get_tls_acceptor().await {
+            if let Some(t) = get_tls_acceptor().await {
                 let ra = RouteAlg(r.remote_addrs, 0, get_index(r.proportion));
                 let o = RouteTls::new(
                     RouteFinder::new(ra, r.remote_protoc),
