@@ -4,11 +4,10 @@ use crate::route::{self, *};
 use crate::state::{self, *};
 use crate::visit::{self, *};
 use async_trait::async_trait;
-use log::{debug, error, trace};
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{OnceCell, RwLock};
 
 const HTTP: &str = "http";
 const HTTP_PT: &str = "http_pt";
@@ -19,23 +18,23 @@ const CERTIFICATE: &str = "certificate";
 const STATE: &str = "state";
 const SHUTDOWN: &str = "shutdown";
 
-const OUTCOMES: [&str; 8] = [
-    "ok",
-    "configuration sentences error",
-    "protocol error",
-    "SocketAddr error",
-    "must be certificate sentence",
-    "certificate error",
-    "server is starting up...",
-    "shutdown error",
+const OUTCOMES: [&[u8]; 8] = [
+    b"ok",
+    b"configuration sentences error",
+    b"protocol error",
+    b"SocketAddr error",
+    b"must be certificate sentence",
+    b"certificate error",
+    b"server is starting up...",
+    b"shutdown error",
 ];
 
 static mut SAFE: bool = false;
 
-static CURRENT: OnceCell<Mutex<Option<ServerState>>> = OnceCell::const_new();
+static CURRENT: OnceCell<RwLock<Option<ServerState>>> = OnceCell::const_new();
 
-async fn current() -> &'static Mutex<Option<ServerState>> {
-    CURRENT.get_or_init(|| async { Mutex::new(None) }).await
+async fn current() -> &'static RwLock<Option<ServerState>> {
+    CURRENT.get_or_init(|| async { RwLock::new(None) }).await
 }
 
 fn to_protoc(s: &str) -> Option<Protoc> {
@@ -54,7 +53,7 @@ async fn send_stop() {
         if SAFE {
             trace!("Close send");
             //send stop signal to current server
-            if let Some(c) = current().await.lock().await.take() {
+            if let Some(c) = current().await.write().await.take() {
                 if let Err(_) = c.send(ControlInfo::Close) {
                     error!("Close send error");
                 }
@@ -65,80 +64,19 @@ async fn send_stop() {
     }
 }
 
-macro_rules! check_safe {
-    () => {
-        unsafe {
-            if SAFE {
-                return OUTCOMES[4].to_string();
-            }
-        }
-    };
-}
-
-async fn handle_cfg(str: String) -> String {
-    match RuleType::from(str) {
-        RuleType::Route(o) => {
-            check_safe!();
-            route::start_up(o);
-            return OUTCOMES[6].to_string();
-        }
-        RuleType::Visit(o) => {
-            check_safe!();
-            visit::start_up(o);
-            return OUTCOMES[6].to_string();
-        }
-        RuleType::CertificateF(a, b) => {
-            if let Err(e) = build_certificate_from_file(a, b).await {
-                error!("certificate error:{:?}", e);
-                return OUTCOMES[5].to_string();
-            }
-            send_stop().await;
-            return OUTCOMES[0].to_string();
-        }
-        RuleType::CertificateS(a, b) => {
-            if let Err(e) = build_certificate_from_socket(a, b).await {
-                error!("certificate error:{:?}", e);
-                return OUTCOMES[5].to_string();
-            }
-            send_stop().await;
-            return OUTCOMES[0].to_string();
-        }
-        RuleType::State(o) => {
-            check_safe!();
-            if let Some(o) = o.and_then(|o| o.parse::<SocketAddr>().ok()) {
-                return state::state_string(&o).await;
-            } else {
-                return state::list().await;
-            }
-        }
-        RuleType::Shutdown(o) => {
-            check_safe!();
-            if let Ok(o) = o.parse::<SocketAddr>() {
-                if state::shutdown(&o).await {
-                    return OUTCOMES[0].to_string();
-                }
-            }
-            return OUTCOMES[7].to_string();
-        }
-        RuleType::None(n) => {
-            check_safe!();
-            return OUTCOMES[n as usize].to_string();
-        }
-    }
-}
-
 enum RuleType {
     Route(RouteInfo),
     Visit(VisitInfo),
     CertificateF(String, String),
     CertificateS(String, String),
-    State(Option<String>),
-    Shutdown(String),
-    None(u8),
+    State(Option<SocketAddr>),
+    Shutdown(SocketAddr),
 }
 
-impl RuleType {
-    pub(crate) fn from(s: String) -> Self {
+impl TryFrom<&str> for RuleType {
+    type Error = usize;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
         trace!("configuration check");
         let mut iter = s.split_whitespace();
         if let Some(a) = iter.next() {
@@ -150,14 +88,20 @@ impl RuleType {
                                 match b {
                                     "f" => {
                                         trace!("certificate configuration");
-                                        return Self::CertificateF(c.to_string(), d.to_string());
+                                        return Ok(Self::CertificateF(
+                                            c.to_string(),
+                                            d.to_string(),
+                                        ));
                                     }
                                     "s" => {
                                         trace!("certificate configuration");
-                                        return Self::CertificateS(c.to_string(), d.to_string());
+                                        return Ok(Self::CertificateS(
+                                            c.to_string(),
+                                            d.to_string(),
+                                        ));
                                     }
                                     _ => {
-                                        return Self::None(5);
+                                        return Err(5);
                                     }
                                 }
                             }
@@ -166,12 +110,14 @@ impl RuleType {
                 }
                 STATE => {
                     trace!("state configuration");
-                    return Self::State(iter.next().map(|s| s.to_string()));
+                    return Ok(Self::State(
+                        iter.next().and_then(|s| s.parse::<SocketAddr>().ok()),
+                    ));
                 }
                 SHUTDOWN => {
-                    if let Some(b) = iter.next() {
+                    if let Some(b) = iter.next().and_then(|b| b.parse::<SocketAddr>().ok()) {
                         trace!("shutdown configuration");
-                        return Self::Shutdown(b.to_string());
+                        return Ok(Self::Shutdown(b));
                     }
                 }
                 _ => {
@@ -181,25 +127,25 @@ impl RuleType {
                         if let Some(p2) = to_protoc(p2) {
                             if let Some(b) = iter.next() {
                                 if b.parse::<SocketAddr>().is_err() {
-                                    return Self::None(3);
+                                    return Err(3);
                                 }
                                 if let Some(c) = iter.next() {
                                     trace!("transfer configuration");
                                     if c.is_empty() {
-                                        return Self::None(3);
+                                        return Err(3);
                                     }
                                     let (ra, mut proportion) = some_addr_proportion(c, iter.next());
                                     divide(&mut proportion);
-                                    return Self::Route(RouteInfo::new(
+                                    return Ok(Self::Route(RouteInfo::new(
                                         p1,
                                         b.to_string(),
                                         p2,
                                         ra,
                                         proportion,
-                                    ));
+                                    )));
                                 } else {
                                     trace!("visit configuration");
-                                    return Self::Visit(VisitInfo::new(p1, b.to_string(), p2));
+                                    return Ok(Self::Visit(VisitInfo::new(p1, b.to_string(), p2)));
                                 }
                             }
                         }
@@ -207,7 +153,69 @@ impl RuleType {
                 }
             }
         }
-        Self::None(1)
+        Err(1)
+    }
+}
+
+macro_rules! check_safe {
+    ($a:ident) => {
+        unsafe {
+            if SAFE {
+                $a.extend_from_slice(OUTCOMES[4]);
+                return;
+            }
+        }
+    };
+}
+
+impl RuleType {
+    async fn handle(self, rsp: &mut Vec<u8>) {
+        match self {
+            Self::Route(o) => {
+                check_safe!(rsp);
+                route::start_up(o);
+                rsp.extend_from_slice(OUTCOMES[6]);
+            }
+            Self::Visit(o) => {
+                check_safe!(rsp);
+                visit::start_up(o);
+                rsp.extend_from_slice(OUTCOMES[6]);
+            }
+            Self::CertificateF(a, b) => {
+                if build_certificate_from_file(a, b).await {
+                    error!("certificate error");
+                    rsp.extend_from_slice(OUTCOMES[5]);
+                    return;
+                }
+                send_stop().await;
+                rsp.extend_from_slice(OUTCOMES[0]);
+            }
+            Self::CertificateS(a, b) => {
+                if build_certificate_from_socket(a, b).await {
+                    error!("certificate error");
+                    rsp.extend_from_slice(OUTCOMES[5]);
+                    return;
+                }
+                send_stop().await;
+                rsp.extend_from_slice(OUTCOMES[0]);
+            }
+            Self::State(o) => {
+                check_safe!(rsp);
+                if let Some(o) = &o {
+                    rsp.extend_from_slice(state::state_string(o).await.as_bytes());
+                } else {
+                    rsp.extend_from_slice(state::list().await.as_bytes());
+                }
+            }
+            Self::Shutdown(o) => {
+                check_safe!(rsp);
+                if state::shutdown(&o).await {
+                    rsp.extend_from_slice(OUTCOMES[0]);
+                } else {
+                    rsp.extend_from_slice(OUTCOMES[7]);
+                }
+            }
+        }
     }
 }
 
@@ -252,10 +260,7 @@ pub(crate) fn build(args: Args) {
 }
 
 async fn start_up(addr: &str, is_tool: bool, ipscope: &Vec<IpAddr>, is_safe: bool) {
-    let (mut server, a, mut b) = if let Ok(server) = Server::new(addr)
-        .await
-        .inspect_err(|e| error!("new server: {:?}", e))
-    {
+    let (mut server, a, mut b) = if let Some(server) = Server::new(addr).await {
         server
     } else {
         return;
@@ -268,7 +273,7 @@ async fn start_up(addr: &str, is_tool: bool, ipscope: &Vec<IpAddr>, is_safe: boo
 
     current()
         .await
-        .lock()
+        .write()
         .await
         .replace(ServerState::new(*server.addr(), a));
 
@@ -276,7 +281,7 @@ async fn start_up(addr: &str, is_tool: bool, ipscope: &Vec<IpAddr>, is_safe: boo
         while let Some(o) = b.recv().await {
             match o {
                 StateInfo::Sum(velocity, date_time) => {
-                    if let Some(ss) = current().await.lock().await.as_mut() {
+                    if let Some(ss) = current().await.write().await.as_mut() {
                         ss.set_velocity(velocity);
                         *ss.date_time_mut() = date_time;
                     }
@@ -287,7 +292,7 @@ async fn start_up(addr: &str, is_tool: bool, ipscope: &Vec<IpAddr>, is_safe: boo
     });
 
     if is_safe {
-        if let Ok(t) = get_tls_acceptor().await {
+        if let Some(t) = get_tls_acceptor().await {
             let o = ServiceTls::new(MainService::new(*server.addr()), t);
             server.accept(o).await;
         } else {
@@ -314,7 +319,15 @@ impl FuncRw for MainService {
         let s = into_str(req);
         req.clear();
         trace!("[{:?}]cfg:{:?}", &self.host, s);
-        rsp.extend_from_slice(handle_cfg(s).await.as_bytes());
+        match RuleType::try_from(s.as_str()) {
+            Ok(o) => {
+                o.handle(rsp).await;
+            }
+            Err(n) => {
+                check_safe!(rsp);
+                rsp.extend_from_slice(OUTCOMES[n]);
+            }
+        }
     }
 }
 
