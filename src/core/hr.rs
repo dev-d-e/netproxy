@@ -1,19 +1,19 @@
-use super::into_str;
-use httpenergy::H1RequestUnits;
-use log::trace;
+use super::*;
+use httpenergy::*;
 
 pub(crate) struct HttpRequest<'a> {
     req: H1RequestUnits,
-    buf: &'a [u8],
+    buf: SliceGet<'a>,
 }
 
 impl<'a> HttpRequest<'a> {
     ///parse request header
-    pub(crate) fn parse(buf: &'a [u8]) -> Result<Self, String> {
+    pub(crate) fn parse(buf: &'a [u8]) -> Result<Self, &'static str> {
         trace!("request buf: {:?}", buf.len());
-        let req = H1RequestUnits::new(buf);
-        if req.is_err() {
-            Err("request err".to_string())
+        let mut buf = buf.into();
+        let req = H1RequestUnits::new(&mut buf);
+        if req.err() {
+            Err("method|target|version err")
         } else {
             Ok(Self { req, buf })
         }
@@ -32,7 +32,9 @@ impl<'a> HttpRequest<'a> {
     }
 
     pub(crate) fn get_header_value(&mut self, str: &str) -> String {
-        self.req.header_value_string(str)
+        self.req
+            .header_value_string(str, &mut self.buf)
+            .unwrap_or_default()
     }
 
     pub(crate) fn get_host(&mut self) -> String {
